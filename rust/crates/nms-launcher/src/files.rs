@@ -306,7 +306,11 @@ pub fn pack_logs(root: &Path) -> Result<PathBuf, String> {
     let file = File::create(&out).map_err(|e| e.to_string())?;
     let mut zip = ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    let note = format!("{}\nPacked {packed}\n", game_build_line(root));
+    let mut note = format!("{}\nPacked {packed}\n", game_build_line(root));
+    for line in crate::proxy::status_lines(root) {
+        note.push_str(&line);
+        note.push('\n');
+    }
     zip.start_file("note.txt", options).map_err(|e| e.to_string())?;
     zip.write_all(note.as_bytes()).map_err(|e| e.to_string())?;
 
@@ -439,6 +443,7 @@ mod tests {
         let folder = root.join("GAMEDATA").join("MODS").join("SomeMod");
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("mod.log"), b"hello").unwrap();
+        std::fs::write(root.join("Binaries").join("winmm.dll"), b"NMS.rs proxy marker").unwrap();
         let zip_path = pack_logs(&root).expect("pack");
         assert!(zip_path.file_name().unwrap().to_string_lossy().starts_with("nms-rs-logs-"));
         let file = File::open(&zip_path).unwrap();
@@ -455,6 +460,7 @@ mod tests {
         io::Read::read_to_string(&mut note, &mut body).unwrap();
         assert!(body.contains("NMS.exe build"), "{body}");
         assert!(body.contains("Packed "), "{body}");
+        assert!(body.contains("NMS.rs loader file: Binaries\\winmm.dll"), "{body}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

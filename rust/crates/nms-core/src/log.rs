@@ -44,14 +44,12 @@ impl Log {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let mut opts = OpenOptions::new();
-        opts.create(true);
-        if s.opened {
-            opts.append(true);
-        } else {
-            opts.write(true).truncate(true);
+        // Empty the file once, then always append: a line another handle adds (a second NMS.rs
+        // DLL's note in core.log) then stays, instead of being overwritten at this handle's cursor.
+        if !s.opened {
+            let _ = OpenOptions::new().create(true).write(true).truncate(true).open(path);
         }
-        s.file = opts.open(path).ok();
+        s.file = OpenOptions::new().create(true).append(true).open(path).ok();
         s.opened |= s.file.is_some();
     }
 
@@ -66,7 +64,7 @@ impl Log {
 }
 
 #[cfg(windows)]
-fn timestamp() -> String {
+pub fn timestamp() -> String {
     use windows_sys::Win32::System::SystemInformation::GetLocalTime;
     let mut t = unsafe { std::mem::zeroed() };
     unsafe { GetLocalTime(&mut t) };
@@ -77,7 +75,7 @@ fn timestamp() -> String {
 }
 
 #[cfg(not(windows))]
-fn timestamp() -> String {
+pub fn timestamp() -> String {
     let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     format!("{}.{:03}", d.as_secs(), d.subsec_millis())
 }
@@ -111,6 +109,22 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<_> = text.lines().map(|l| l.rsplit(' ').next().unwrap()).collect();
         assert_eq!(lines, ["one", "two"], "{text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A line appended through another handle (the second-DLL note) survives later writes.
+    #[test]
+    fn keeps_lines_from_another_handle() {
+        let path = std::env::temp_dir().join(format!("nms-core-log-shared-{}.log", std::process::id()));
+        let log = Log::open(&path, true);
+        log.info("first");
+        let mut other = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(other, "x note").unwrap();
+        drop(other);
+        log.info("second");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = text.lines().map(|l| l.rsplit(' ').next().unwrap()).collect();
+        assert_eq!(lines, ["first", "note", "second"], "{text}");
         let _ = std::fs::remove_file(&path);
     }
 

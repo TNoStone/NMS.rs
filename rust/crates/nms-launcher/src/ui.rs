@@ -18,6 +18,7 @@ use crate::manager_settings::{self as mset, ManagerSettings, SCALE_DEFAULT, SCAL
 use crate::migrate::{self, Legacy};
 use crate::mods;
 use crate::palette as pal;
+use crate::proxy;
 use crate::sizes::apply::{self, ApplySpec};
 use crate::store::{self, Store};
 use crate::style as st;
@@ -268,6 +269,8 @@ struct Manager {
     sizes_open: bool,
     /// The live Smaller Inventory Slots side bar predates the Foods and Custom buttons.
     side_bar_old: bool,
+    /// Names under which an NMS.rs loader DLL sits in Binaries (`proxy::installed`).
+    loaders: Vec<&'static str>,
     /// What is left of an old NMS.py (version 3) setup; `None` until the first check is back.
     legacy: Option<Legacy>,
     /// The check runs on its own thread (it walks NMS.py and reads Steam's config).
@@ -346,9 +349,6 @@ enum Tab {
     Settings,
 }
 
-/// Steam launch option a Linux / Proton user pastes so Wine loads our xinput9_1_0.dll instead of
-/// its built-in one. Windows needs nothing.
-const PROTON_LAUNCH_OPTION: &str = "WINEDLLOVERRIDES=\"xinput9_1_0=n,b\" %command%";
 const RUNNING_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Manager {
@@ -358,6 +358,7 @@ impl Manager {
         }
         let rows = rows_from_disk(&root);
         let side_bar_old = mods::side_bar_outdated(&root);
+        let loaders = proxy::installed(&root);
         let sizes = load_size_fields(&root);
         let prefs = mset::load(&root);
         let i18n = I18n::new(&prefs.language);
@@ -376,6 +377,7 @@ impl Manager {
             fonts_warned: Vec::new(),
             sizes_open: false,
             side_bar_old,
+            loaders,
             tab: Tab::Mods,
             failed: false,
             message: String::new(),
@@ -924,19 +926,27 @@ impl Manager {
             });
     }
 
-    /// Linux / Proton beta notice with the one Steam launch option those users need.
+    /// Linux / Proton beta notice with the one Steam launch option those users need, for the
+    /// loader file they have (xinput9_1_0, or winmm / version from a "DLL only" download).
+    /// Windows needs nothing.
     fn linux_note(&mut self, ui: &mut egui::Ui) {
         if !self.wine {
             return;
         }
+        let name = match self.loaders.as_slice() {
+            [one] => *one,
+            _ => proxy::MAIN,
+        };
+        let option = proxy::wine_launch_option(name);
         panel_frame().fill(pal::NOTICE_FILL).stroke(egui::Stroke::new(st::STROKE, pal::ATTENTION.gamma_multiply(0.6))).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add(egui::Label::new(egui::RichText::new(self.i18n.t("rs_linux_title")).strong().color(pal::WARN)).wrap());
-            ui.add(egui::Label::new(self.i18n.t("rs_linux_help")).wrap());
+            // Every translation names the file as xinput9_1_0.dll.
+            ui.add(egui::Label::new(self.i18n.t("rs_linux_help").replace(proxy::MAIN, name)).wrap());
             ui.horizontal_wrapped(|ui| {
-                ui.add(egui::Label::new(egui::RichText::new(PROTON_LAUNCH_OPTION).monospace().color(pal::TEXT_STRONG)).wrap());
+                ui.add(egui::Label::new(egui::RichText::new(&option).monospace().color(pal::TEXT_STRONG)).wrap());
                 if ui.add(styled_button(self.i18n.t("rs_copy"), Look::Secondary)).clicked() {
-                    ui.ctx().copy_text(PROTON_LAUNCH_OPTION.to_string());
+                    ui.ctx().copy_text(option.clone());
                     self.failed = false;
                     self.message = self.i18n.t("rs_copied");
                     self.message_detail.clear();
@@ -950,6 +960,18 @@ impl Manager {
     fn refresh(&mut self) {
         self.rows = rows_from_disk(&self.root);
         self.side_bar_old = mods::side_bar_outdated(&self.root);
+        self.loaders = proxy::installed(&self.root);
+    }
+
+    /// Two NMS.rs loader files in Binaries (say xinput9_1_0.dll and winmm.dll): only the first to
+    /// load runs the mods, the other only passes calls through.
+    fn loader_note(&self, ui: &mut egui::Ui) {
+        if self.loaders.len() < 2 {
+            return;
+        }
+        let text = self.i18n.t("rs_loader_twice").replace("{files}", &self.loaders.join(", "));
+        ui.add(egui::Label::new(egui::RichText::new(text).color(pal::WARN).strong()).wrap());
+        ui.add_space(st::S3);
     }
 
     /// "Press Apply sizes ..." while the side bar is an old layout (update keeps size-built files).
@@ -1551,6 +1573,7 @@ impl Manager {
     fn mods_page(&mut self, ui: &mut egui::Ui, running: bool) {
         self.legacy_panel(ui, running);
         self.linux_note(ui);
+        self.loader_note(ui);
         self.side_bar_note(ui);
         self.card_grid(ui, running);
         ui.add_space(st::S2);

@@ -1,6 +1,6 @@
 [package]
 name = "nms-proxy"
-description = "xinput9_1_0.dll proxy that loads the Rust mod core into NMS.exe at startup."
+description = "xinput9_1_0.dll proxy (or winmm.dll / version.dll) that loads the Rust mod core into NMS.exe at startup."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -26,4 +26,9 @@ winresource.workspace = true
 # Dev-only "NMS.rs self-test" section on the Mods page (live hook and patch switches for the core
 # gate). Never enabled by default, by release.py or by the dist build.
 selftest = []
+# Build the loader under another DLL name that NMS.exe loads at startup, for players whose
+# xinput9_1_0.dll belongs to another mod. One at a time; the file is still written as
+# xinput9_1_0.dll and `release.py rust-build` renames it. Exports: `exports\<name>.txt`.
+as-winmm = []
+as-version = []
 

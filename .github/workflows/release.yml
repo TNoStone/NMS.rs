@@ -1,6 +1,7 @@
 name: Release
 
-# Push a tag like v4.0.0: GitHub builds the zip from this commit and attaches it to a Release.
+# Push a tag like v4.0.0: GitHub builds the zip from this commit and attaches it to a Release,
+# with the "DLL only" zips (the loader as winmm.dll and version.dll) next to it.
 on:
   push:
     tags: ["v*"]
@@ -33,19 +34,22 @@ jobs:
         working-directory: rust
         run: cargo test --workspace
 
-      - name: Build exe and DLL (dist profile)
+      - name: Build exe and DLLs (dist profile)
         run: python -I release.py rust-build --version ${{ env.VERSION }}
 
-      - name: Build zip
+      - name: Build zips
         run: python -I release.py rust --version ${{ env.VERSION }} --out out
 
       - name: Check zip contents
         run: python -I dev/test_release_rust.py
 
-      # Lets anyone check the zip was built here from this commit: gh attestation verify <zip> -R <repo>
+      - name: Check the winmm.dll and version.dll loaders pass calls through
+        run: python -I dev/test_proxy_variants.py
+
+      # Lets anyone check the zips were built here from this commit: gh attestation verify <zip> -R <repo>
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: out/NMS.rs-${{ env.VERSION }}.zip
+          subject-path: out/NMS.rs-${{ env.VERSION }}*.zip
 
       - name: Publish Release
         shell: bash
@@ -53,9 +57,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           zip="out/NMS.rs-${VERSION}.zip"
+          winmm="out/NMS.rs-${VERSION}-winmm.zip"
+          version="out/NMS.rs-${VERSION}-version.zip"
           notes="NMS.rs ${VERSION}, built by GitHub Actions from this tag.
 
           Install: extract the zip into your No Man's Sky folder (the one with Binaries and GAMEDATA), open NMS.rs\\nms-rs.exe, install the mods you want and press Play.
 
-          SHA-256: $(cut -d' ' -f1 "${zip}.sha256")"
-          gh release create "$GITHUB_REF_NAME" "$zip" "${zip}.sha256" --title "NMS.rs ${VERSION}" --notes "$notes"
+          Another mod already uses Binaries\\xinput9_1_0.dll? Keep it and also extract one of the DLL only zips: -winmm (Binaries\\winmm.dll, not beside Snap Angles' winmm.dll) or -version (Binaries\\version.dll).
+
+          SHA-256: $(cut -d' ' -f1 "${zip}.sha256")
+          SHA-256 winmm: $(cut -d' ' -f1 "${winmm}.sha256")
+          SHA-256 version: $(cut -d' ' -f1 "${version}.sha256")"
+          gh release create "$GITHUB_REF_NAME" "$zip" "${zip}.sha256" "$winmm" "${winmm}.sha256" "$version" "${version}.sha256" --title "NMS.rs ${VERSION}" --notes "$notes"

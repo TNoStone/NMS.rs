@@ -1,7 +1,9 @@
 //! `nms-rs <command>`
 //!
-//!   install [--force]   copy xinput9_1_0.dll (next to this exe) into <game>\Binaries
-//!   uninstall           remove it again, only if it is ours
+//!   install [--force] [--as winmm|version|xinput9_1_0]
+//!                       copy the loader DLL (next to this exe) into <game>\Binaries: by default
+//!                       the name NMS.rs already has there, else xinput9_1_0.dll
+//!   uninstall           remove our loader DLL under every name, never another mod's file
 //!   disable | enable    create or remove <game>\NMS.rs\disabled (kill switch)
 //!   status              list the loaded mods and their settings (game must be running)
 //!   set <mod> <key> <true|false|text>
@@ -35,6 +37,7 @@ mod migrate;
 mod mods;
 mod palette;
 mod play;
+mod proxy;
 mod setup;
 mod shortcut;
 mod steam;
@@ -44,49 +47,83 @@ mod store;
 mod tools;
 mod ui;
 
-const DLL: &str = "xinput9_1_0.dll";
-/// Exported by our proxy (`NMS_RS_PROXY_MARKER`), to tell it apart from someone else's xinput proxy.
-const MARKER: &[u8] = b"NMS.rs proxy marker";
-
 fn game_root() -> Option<PathBuf> {
     let from_exe = std::env::current_exe().ok().and_then(|e| e.parent().and_then(paths::find_game_root));
     from_exe.or_else(|| std::env::current_dir().ok().and_then(|d| paths::find_game_root(&d)))
 }
 
-fn is_ours(path: &Path) -> bool {
-    std::fs::read(path).map(|b| b.windows(MARKER.len()).any(|w| w == MARKER)).unwrap_or(false)
+pub(crate) fn install(root: &Path, force: bool) -> Result<String, String> {
+    install_as(root, force, None)
 }
 
-pub(crate) fn install(root: &Path, force: bool) -> Result<String, String> {
+/// Copy `<name>` from next to this exe into `Binaries\`. Never over another mod's file of that name
+/// unless forced. With `--as`, our files under the other names go, so only one loader stays.
+fn install_as(root: &Path, force: bool, wanted: Option<&str>) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let src = exe.parent().ok_or("no exe folder")?.join(DLL);
+    let here = exe.parent().ok_or("no exe folder")?;
+    let installed = proxy::installed(root);
+    let name = match wanted {
+        Some(w) => proxy::NAMES
+            .iter()
+            .copied()
+            .find(|n| n.eq_ignore_ascii_case(w) || n.trim_end_matches(".dll").eq_ignore_ascii_case(w))
+            .ok_or_else(|| format!("unknown loader name {w}; use one of {}", proxy::NAMES.join(", ")))?,
+        None => match installed.as_slice() {
+            [one] => *one,
+            _ => proxy::MAIN,
+        },
+    };
+    let src = here.join(name);
+    let dst = proxy::path(root, name);
     if !src.is_file() {
-        return Err(format!("{} not found next to this program", DLL));
+        if wanted.is_none() && installed.contains(&name) {
+            // A "DLL only" file from Nexus; the main zip has no copy of that name to update it from.
+            return Ok(format!("{} is NMS.rs; left as it is (update it from the NMS.rs {name} file)", dst.display()));
+        }
+        return Err(format!("{name} not found next to this program"));
     }
-    let dst = root.join("Binaries").join(DLL);
-    if dst.is_file() && !is_ours(&dst) && !force {
-        // Snap Angles ships an xinput and a winmm version; only the winmm one runs beside NMS.rs.
+    if dst.is_file() && !proxy::is_ours(&dst) && !force {
+        // Snap Angles ships an xinput and a winmm version; NMS.rs also comes as winmm.dll and version.dll.
         return Err(format!(
-            "{} already holds another {DLL}; not replacing it (use --force). If it belongs to another \
-             mod, install that mod's winmm.dll version instead (Snap Angles has one).",
+            "{} belongs to another mod; not replacing it (use --force). Keep it and install the NMS.rs \
+             winmm.dll or version.dll file from Nexus instead (not winmm.dll if Snap Angles' winmm.dll is \
+             there).",
             dst.display()
         ));
     }
     std::fs::create_dir_all(paths::loader_dir(root).join("logs")).map_err(|e| e.to_string())?;
     std::fs::copy(&src, &dst).map_err(|e| format!("copy failed (is the game running?): {e}"))?;
-    Ok(format!("installed {}", dst.display()))
+    let mut lines = vec![format!("installed {}", dst.display())];
+    if wanted.is_some() {
+        for other in installed.iter().filter(|n| **n != name) {
+            let path = proxy::path(root, other);
+            std::fs::remove_file(&path).map_err(|e| format!("remove failed (is the game running?): {e}"))?;
+            lines.push(format!("removed {} (NMS.rs, replaced by {name})", path.display()));
+        }
+    }
+    lines.extend(proxy::twice_warning(&proxy::installed(root)));
+    Ok(lines.join("\n"))
 }
 
+/// Remove our loader DLL under every name. Another mod's file of the same name stays.
 fn uninstall(root: &Path) -> Result<String, String> {
-    let dst = root.join("Binaries").join(DLL);
-    if !dst.is_file() {
-        return Ok("nothing to remove".into());
+    let mut lines = Vec::new();
+    for name in proxy::NAMES {
+        let path = proxy::path(root, name);
+        if !path.is_file() {
+            continue;
+        }
+        if !proxy::is_ours(&path) {
+            lines.push(format!("{} is not ours; leaving it", path.display()));
+            continue;
+        }
+        std::fs::remove_file(&path).map_err(|e| format!("remove failed (is the game running?): {e}"))?;
+        lines.push(format!("removed {}", path.display()));
     }
-    if !is_ours(&dst) {
-        return Err(format!("{} is not ours; leaving it", dst.display()));
+    if !lines.iter().any(|l| l.starts_with("removed")) {
+        lines.insert(0, "nothing to remove".into());
     }
-    std::fs::remove_file(&dst).map_err(|e| format!("remove failed (is the game running?): {e}"))?;
-    Ok(format!("removed {}", dst.display()))
+    Ok(lines.join("\n"))
 }
 
 fn kill_switch(root: &Path, disable: bool) -> Result<String, String> {
@@ -127,6 +164,21 @@ fn set(mod_name: &str, key: &str, raw: &str) -> Result<String, String> {
     }
 }
 
+/// `install [--force] [--as <name>]`, flags in any order.
+fn install_cli(root: &Path, flags: &[&str]) -> Result<String, String> {
+    let mut force = false;
+    let mut wanted = None;
+    let mut rest = flags.iter();
+    while let Some(flag) = rest.next() {
+        match *flag {
+            "--force" => force = true,
+            "--as" => wanted = Some(*rest.next().ok_or("--as needs a name: winmm, version or xinput9_1_0")?),
+            other => return Err(format!("unknown install option {other}")),
+        }
+    }
+    install_as(root, force, wanted)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -151,8 +203,7 @@ fn main() -> ExitCode {
         return ui::run(r);
     }
     let result = match (words.as_slice(), &root) {
-        (["install"], Some(r)) => install(r, false),
-        (["install", "--force"], Some(r)) => install(r, true),
+        (["install", flags @ ..], Some(r)) => install_cli(r, flags),
         (["uninstall"], Some(r)) => uninstall(r),
         (["disable"], Some(r)) => kill_switch(r, true),
         (["enable"], Some(r)) => kill_switch(r, false),
@@ -177,7 +228,7 @@ fn main() -> ExitCode {
         (["mods", rest @ ..], Some(r)) => crate::mods::cli(r, rest),
         (["sizes", rest @ ..], Some(r)) => crate::sizes::apply::cli(r, rest),
         (["migrate", rest @ ..], Some(r)) => return migrate::cli(r, rest),
-        _ => Err("usage: nms-rs [manager] | install [--force] | uninstall | disable | enable | status | set <mod> <key> <value> | play [<game command>...] | prepare | pack-logs | conflicts | merge --plan | setup [--yes] [--no-shortcut] [--force] | steam-option status | set | remove [--yes] | mods park|unpark|install|update <name> | park-all | install-all | update-all | cleanup-python | strip-launch | status | sizes apply --columns N --rows auto|N --window F --slots P [--no-filters] | migrate [--yes]".into()),
+        _ => Err("usage: nms-rs [manager] | install [--force] [--as winmm|version|xinput9_1_0] | uninstall | disable | enable | status | set <mod> <key> <value> | play [<game command>...] | prepare | pack-logs | conflicts | merge --plan | setup [--yes] [--no-shortcut] [--force] | steam-option status | set | remove [--yes] | mods park|unpark|install|update <name> | park-all | install-all | update-all | cleanup-python | strip-launch | status | sizes apply --columns N --rows auto|N --window F --slots P [--no-filters] | migrate [--yes]".into()),
     };
     match result {
         Ok(text) => {
@@ -188,5 +239,36 @@ fn main() -> ExitCode {
             eprintln!("{text}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Our files go under every name; another mod's xinput9_1_0.dll stays.
+    #[test]
+    fn uninstall_removes_ours_under_any_name_only() {
+        let root = std::env::temp_dir().join(format!("nms-rs-uninstall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Binaries")).unwrap();
+        std::fs::write(proxy::path(&root, "xinput9_1_0.dll"), b"MZ snap angles").unwrap();
+        std::fs::write(proxy::path(&root, "winmm.dll"), b"MZ NMS.rs proxy marker").unwrap();
+        std::fs::write(proxy::path(&root, "version.dll"), b"MZ NMS.rs proxy marker").unwrap();
+        let text = uninstall(&root).unwrap();
+        assert!(text.contains("winmm.dll") && text.contains("version.dll"), "{text}");
+        assert!(text.contains("xinput9_1_0.dll is not ours; leaving it"), "{text}");
+        assert!(proxy::path(&root, "xinput9_1_0.dll").is_file());
+        assert!(proxy::installed(&root).is_empty());
+        assert!(uninstall(&root).unwrap().starts_with("nothing to remove"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_flags() {
+        let root = std::env::temp_dir();
+        assert!(install_cli(&root, &["--as"]).unwrap_err().contains("needs a name"));
+        assert!(install_cli(&root, &["--bogus"]).unwrap_err().contains("unknown install option"));
+        assert!(install_cli(&root, &["--as", "dinput8"]).unwrap_err().contains("unknown loader name"));
     }
 }

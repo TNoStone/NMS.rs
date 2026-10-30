@@ -6,10 +6,19 @@
 (`crates/nms-proxy`). The four XInput functions pass straight through to the real System32 DLL,
 so controllers work as before.
 
+Only one file can be called `xinput9_1_0.dll`, and other mods ship one too. So the same loader is
+also built as `winmm.dll` (imported by `NMS.exe`) and `version.dll` (imported by the PlayFab, DLSS
+and Streamline DLLs that `NMS.exe` loads at startup). Once loaded, every module that imports that
+name gets our file, so these forward every export of the System32 DLL: one small stub per export
+(`crates/nms-proxy/exports/*.txt`), which loads the real DLL by full path on its first call. The
+manager tells our files apart from other mods' by a marker inside them, not by name.
+
 `DllMain` does nothing but start one boot thread and return, so no work runs under the loader
 lock. The boot thread:
 
-1. stops at once if `NMS.rs\disabled` exists (kill switch) or the host process is not `NMS.exe`;
+1. stops at once if the host process is not `NMS.exe`, or if another NMS.rs file already booted
+   in this process (two installed, say `xinput9_1_0.dll` and `winmm.dll`: the second only
+   forwards and writes one line to `core.log`), or if `NMS.rs\disabled` exists (kill switch);
 2. runs `NMS.rs\nms-rs.exe prepare` when the combined UI merge is out of date (see below);
 3. takes a copy of the game's code section at load time, so later searches see the original
    bytes even after another mod has hooked a function;

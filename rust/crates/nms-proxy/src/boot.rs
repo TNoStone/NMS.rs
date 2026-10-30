@@ -22,8 +22,13 @@ pub fn run() {
         return;
     }
     let dir = paths::loader_dir(&root);
+    let dll = crate::own_file_name();
+    if !claim_process() {
+        second_copy_note(&dir, &dll);
+        return;
+    }
     let log = Arc::new(Log::open(&dir.join("logs").join("core.log"), true));
-    log.info(&format!("nms-rs {} loaded into {}", nms_core::ipc::VERSION, exe.display()));
+    log.info(&format!("nms-rs {} loaded into {} as {dll}", nms_core::ipc::VERSION, exe.display()));
     if dir.join("disabled").exists() {
         log.info("NMS.rs\\disabled exists: staying vanilla");
         return;
@@ -61,6 +66,40 @@ pub fn run() {
     let pipe_log = log.clone();
     nms_core::ipc::serve(registry, move |m| pipe_log.info(m));
     log.info("settings pipe ready");
+}
+
+/// True for the first NMS.rs DLL to start in this process. Two can be installed at once (for
+/// example xinput9_1_0.dll from the main zip and winmm.dll from a "DLL only" file); the second
+/// must only forward. A named mutex per process id decides; its handle stays open for good.
+fn claim_process() -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
+    // SAFETY: plain call with no inputs.
+    let pid = unsafe { GetCurrentProcessId() };
+    let name: Vec<u16> = format!("Local\\NMS.rs-loader-{pid}\0").encode_utf16().collect();
+    // SAFETY: NUL-terminated name, default security, not initially owned.
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        // Cannot tell; boot as a single install would.
+        return true;
+    }
+    // SAFETY: read right after CreateMutexW on this thread.
+    unsafe { GetLastError() != ERROR_ALREADY_EXISTS }
+}
+
+/// The one line a second NMS.rs DLL writes. It waits first: the booting copy empties core.log
+/// when it opens it (and appends after that, so this line stays).
+fn second_copy_note(loader: &Path, dll: &str) {
+    use std::io::Write;
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let line = format!(
+        "second NMS.rs loader file {dll}: another NMS.rs file started first, this one only \
+         passes calls through. Keep one NMS.rs file in Binaries."
+    );
+    let path = loader.join("logs").join("core.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{} {line}", nms_core::log::timestamp());
+    }
 }
 
 /// Resolve the game context and hook `cGcApplication::Update`. Any failure is logged and the
@@ -160,6 +199,14 @@ mod tests {
 
     fn fake_output(code: u32, stdout: &[u8], stderr: &[u8]) -> Output {
         Output { status: ExitStatus::from_raw(code), stdout: stdout.to_vec(), stderr: stderr.to_vec() }
+    }
+
+    /// The first claim in a process wins; every later one (a second NMS.rs DLL) is refused.
+    #[test]
+    fn only_the_first_claim_boots() {
+        assert!(claim_process());
+        assert!(!claim_process());
+        assert!(!claim_process());
     }
 
     #[test]

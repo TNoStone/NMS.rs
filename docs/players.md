@@ -11,6 +11,20 @@
 Every mod arrives parked: its files wait in `NMS.rs\stock` until you click Install. GOG and other
 stores: the loader starts with any copy of the game, but only Steam is tested.
 
+### Another mod already uses `Binaries\xinput9_1_0.dll`
+
+Only one file can have that name. Keep the other mod's file (do not let the NMS.rs zip replace
+it), then also download one "DLL only" file from the Nexus page and extract it into the game
+folder:
+
+- `NMS.rs-<version>-winmm.zip` puts the loader in `Binaries\winmm.dll`. Not together with Snap
+  Angles' own `winmm.dll` version: only one of the two can be there.
+- `NMS.rs-<version>-version.zip` puts it in `Binaries\version.dll`.
+
+Keep one NMS.rs loader file in `Binaries`. With two, only the first one runs the mods and the
+manager shows a warning. On Proton the launch option uses that name, for example
+`WINEDLLOVERRIDES="winmm=n,b" %command%`; the manager shows the right one.
+
 ### Linux and Steam Deck (Proton, beta)
 
 Wine prefers its own xinput DLL, so the game needs one launch option:
@@ -116,6 +130,7 @@ game works as in vanilla. Nothing crashes because of a moved signature. Wait for
 
 ## Uninstall
 
-Delete `Binaries\xinput9_1_0.dll` and the `NMS.rs` folder, then delete the mod folders you
-installed from `GAMEDATA\MODS` (and `z_Combined Mods`). `nms-rs uninstall` removes the DLL, and
-only if it is ours.
+Delete `Binaries\xinput9_1_0.dll` (or the `winmm.dll` / `version.dll` NMS.rs file) and the
+`NMS.rs` folder, then delete the mod folders you installed from `GAMEDATA\MODS` (and
+`z_Combined Mods`). `nms-rs uninstall` removes our DLL under any of those names, and never
+another mod's file.

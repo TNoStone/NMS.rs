@@ -16,6 +16,29 @@ import release  # noqa: E402
 # build (cargo build --release -p nms-launcher -p nms-proxy). <target> follows CARGO_TARGET_DIR.
 if not (release.RUST_TARGET / "nms-rs.exe").is_file():
     release.RUST_TARGET = release._target_dir() / "release"
+    release.PROXY_VARIANT_DIR = release.RUST_TARGET / "variants"
+
+
+def check_variant_zips() -> None:
+    """NMS.rs-<v>-winmm.zip and -version.zip: the DLL under its own name, a README, nothing else."""
+    if not all((release.PROXY_VARIANT_DIR / dll).is_file() for dll in release.PROXY_VARIANTS):
+        if release.RUST_TARGET.name == "dist":
+            raise SystemExit(f"no variant DLLs in {release.PROXY_VARIANT_DIR}: run release.py rust-build")
+        print("variant zips skipped: dev build without variants")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        made = release.make_variant_zips("4.0.0", Path(tmp))
+        assert [p.name for p in made] == ["NMS.rs-4.0.0-winmm.zip", "NMS.rs-4.0.0-version.zip"], made
+        for path, dll in zip(made, release.PROXY_VARIANTS):
+            sidecar = Path(tmp) / f"{path.name}.sha256"
+            assert sidecar.read_text().split()[0] == release._sha256(path), f"bad {sidecar.name}"
+            with zipfile.ZipFile(path) as z:
+                assert sorted(z.namelist()) == [f"Binaries/{dll}", "README.txt"], z.namelist()
+                readme = z.read("README.txt").decode()
+                assert "—" not in readme, "em dash in README"
+                assert f'WINEDLLOVERRIDES="{dll[:-4]}=n,b"' in readme, readme
+                assert b"NMS.rs proxy marker" in z.read(f"Binaries/{dll}"), f"{dll} is not ours"
+    print("ok: variant zips")
 
 
 def main() -> int:
@@ -47,6 +70,7 @@ def main() -> int:
                      + [("QuickTransferAll", "QUICKDEPOSIT.DDS"), ("QuickTransferAll", "SUITLOCK.DDS")]):
         assert f"NMS.rs/stock/{mod}/{icons}{dds}" in names, f"{mod} icon {dds} not shipped"
     print(f"ok: {len(names)} files, no .py")
+    check_variant_zips()
     return 0
 
 

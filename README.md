@@ -65,8 +65,13 @@ py -3 release.py rust --version 4.0.4 --out %TEMP%\nmsrs-zip
 
 `rust-build` builds `nms-rs.exe` and `xinput9_1_0.dll` with the `dist` profile (no debug info, no
 symbols, build paths remapped) and fails if your user or repository folder name is still inside
-them. `rust` writes `NMS.rs-<version>.zip`, a `SHA256SUMS.txt` inside it and a `.sha256` file next
-to it. Both honour `CARGO_TARGET_DIR`. `py -3 -I dev\test_release_rust.py` checks the zip contents.
+them. It also builds the loader as `winmm.dll` and `version.dll` (Cargo features `as-winmm`,
+`as-version`) for players whose `xinput9_1_0.dll` belongs to another mod, and checks that each
+exports exactly what its System32 namesake exports. `rust` writes `NMS.rs-<version>.zip`, a
+`SHA256SUMS.txt` inside it and a `.sha256` file next to it, plus `NMS.rs-<version>-winmm.zip` and
+`NMS.rs-<version>-version.zip` ("DLL only" files). Both honour `CARGO_TARGET_DIR`.
+`py -3 -I dev\test_release_rust.py` checks the zips, `py -3 -I dev\test_proxy_variants.py` calls
+through the winmm and version DLLs.
 
 For a quick local test, `cargo build --release -p nms-launcher -p nms-proxy`, then
 `target\release\nms-rs.exe install` from inside a game folder copies the DLL into `Binaries`
@@ -79,7 +84,7 @@ rust/                       Cargo workspace
   crates/nms-core           pattern scan, live patches, hooks, settings, logs, settings pipe
   crates/nms-sdk            signature tables, one module per mod
   crates/nms-mods           the mods (one GameMod each) and shared hooks
-  crates/nms-proxy          xinput9_1_0.dll: boot thread, registers the mods
+  crates/nms-proxy          xinput9_1_0.dll (or winmm.dll, version.dll): boot thread, registers the mods
   crates/nms-launcher       nms-rs.exe: manager window and CLI (install, mods, sizes, merge, migrate)
   crates/nms-amumss         reads AMUMSS lua scripts and applies their change tables to MXML
   crates/sigcheck           offline check of every signature against an NMS.exe

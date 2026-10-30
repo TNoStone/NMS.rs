@@ -17,6 +17,7 @@
   "rs_not_installed": "not installed",
   "rs_outdated": "update available",
   "rs_side_bar_old": "Your Smaller Inventory Slots side bar is from an older version. Press {button} once to add the new filter buttons (Foods, Custom) and the new icons.",
+  "rs_loader_twice": "Two NMS.rs loader files are in Binaries: {files}. Only one of them runs the mods. Close the game and delete the one you do not need.",
   "rs_click_to_open": "(click to open)",
   "rs_cleanup_title": "Clean up old files",
   "rs_cleanup_nothing_hint": "nothing to clean",
