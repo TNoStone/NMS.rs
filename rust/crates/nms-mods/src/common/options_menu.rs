@@ -136,6 +136,8 @@ static LOG: OnceLock<Arc<Log>> = OnceLock::new();
 static HEADER: AtomicUsize = AtomicUsize::new(0);
 static BUTTON: AtomicUsize = AtomicUsize::new(0);
 static BOOLEAN: AtomicUsize = AtomicUsize::new(0);
+/// Validated native page field; zero leaves the existing main-menu click guard in place.
+static ROW_DISABLED_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static INT: AtomicUsize = AtomicUsize::new(0);
 static FLOAT: AtomicUsize = AtomicUsize::new(0);
 static BEGIN_LIST: AtomicUsize = AtomicUsize::new(0);
@@ -302,6 +304,14 @@ pub fn install(image: &ProcessImage, registry: Arc<Registry>, log: Arc<Log>) {
     }
     let _ = REGISTRY.set(registry.clone());
     let _ = LOG.set(log.clone());
+    let boolean = BOOLEAN.load(Ordering::Acquire) - image.base();
+    match row_disabled_offset(image, boolean) {
+        Some(offset) => {
+            ROW_DISABLED_OFFSET.store(offset, Ordering::Release);
+            log.info("in-game Mods menu: native disabled text-row styling ready");
+        }
+        None => log.info("in-game Mods menu: disabled row styling unavailable; main-menu text edits remain blocked"),
+    }
     match install_text(image) {
         Ok(()) => log.info("in-game Mods menu: text rows ready (game text-entry popup)"),
         Err(e) => log.info(&format!("in-game Mods menu: no text rows: {e}")),
@@ -384,6 +394,49 @@ fn install_text(image: &ProcessImage) -> Result<(), String> {
     install_back_guard(image)?;
     TEXT_READY.store(true, Ordering::Release);
     Ok(())
+}
+
+/// BOOLEAN calls this native helper with the page in RDX. Check its call and page+0x18 load
+/// before using the disabled state that selects DISABLE/DISABLED and skips click tests.
+fn row_disabled_offset(image: &dyn Code, boolean: usize) -> Option<usize> {
+    if image.read(boolean + 0x7F, 9)?.as_slice() != [0x48, 0x8B, 0xD6, 0x48, 0x8D, 0x4C, 0x24, 0x40, 0xE8] {
+        return None;
+    }
+    let helper = image.rel32_target(boolean + 0x88)?;
+    let expected = [
+        0x48, 0x89, 0x5C, 0x24, 0x10, 0x44, 0x89, 0x44, 0x24, 0x18,
+        0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+        0x48, 0x8D, 0x6C, 0x24, 0xD9, 0x48, 0x81, 0xEC, 0x90, 0, 0, 0,
+        0x44, 0x8B, 0x72, 0x18,
+    ];
+    (image.read(helper, expected.len())?.as_slice() == expected).then_some(0x18)
+}
+
+/// Restore the page's previous disabled state immediately after one synchronous widget call.
+struct DisabledRow {
+    address: usize,
+    previous: u32,
+}
+
+impl DisabledRow {
+    fn enter(page: usize, offset: usize) -> Option<Self> {
+        if offset == 0 {
+            return None;
+        }
+        let address = page.checked_add(offset)?;
+        let previous = read_u32(address)?;
+        // SAFETY: offset was validated from the native helper; this is a live Options page.
+        unsafe { nms_core::mem::write(address, 1u32) }.then_some(Self { address, previous })
+    }
+}
+
+impl Drop for DisabledRow {
+    fn drop(&mut self) {
+        // SAFETY: same page field, restored immediately after its synchronous widget call.
+        if !unsafe { nms_core::mem::write(self.address, self.previous) } {
+            info("could not restore Options page disabled state");
+        }
+    }
 }
 
 /// Refuse the Options page's "go back" while our text box is open: the press that closes the box with
@@ -871,7 +924,12 @@ fn draw_text(
     let desc = if editable { row.desc } else { ui.no_edit };
     // Shown as "off" (0); the default is 1 while the text differs from its default, so Reset stays enabled.
     let differs = row.default.as_ref().and_then(|d| d.as_str()).is_some_and(|d| d != value);
-    let clicked = unsafe { boolean(page, row.label, desc, 0, u8::from(differs), &cell) } & 1 != 0;
+    let clicked = {
+        let _disabled = (!editable)
+            .then(|| DisabledRow::enter(page as usize, ROW_DISABLED_OFFSET.load(Ordering::Acquire)))
+            .flatten();
+        (unsafe { boolean(page, row.label, desc, 0, u8::from(differs), &cell) } & 1) != 0
+    };
     if clicked && !waiting && editable {
         // The popup starts from the staged value if there is one, so an edit builds on it.
         if let Ok(mut click) = TEXT_CLICK.lock() {
@@ -1198,6 +1256,7 @@ fn on_switcher(args: &options_game_switcher::Args, _ret: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nms_core::FileImage;
 
     #[test]
     fn fixed64_cuts_on_a_character_boundary_and_terminates() {
@@ -1231,5 +1290,63 @@ mod tests {
         assert_eq!(cell_text("ion battery", "(not set)"), "ion battery");
         assert!(cell_text(&"x".repeat(80), "(not set)").ends_with("..."));
         assert_eq!(cell_text("  ", "(not set)"), "(not set)");
+    }
+
+    #[test]
+    fn disabled_row_restores_the_previous_state_before_the_next_widget() {
+        for previous in [0u32, 7] {
+            let mut page = [42u32; 12];
+            page[6] = previous;
+            let original = page;
+            let address = page.as_mut_ptr() as usize;
+            {
+                let _disabled = DisabledRow::enter(address, 0x18).unwrap();
+                assert_eq!(page[6], 1);
+                assert_eq!(page[5], 42);
+                assert_eq!(page[7], 42);
+            }
+            assert_eq!(page, original);
+            assert!(DisabledRow::enter(address, 0).is_none());
+            assert_eq!(page, original);
+        }
+        assert!(DisabledRow::enter(0, 0x18).is_none());
+        assert!(DisabledRow::enter(usize::MAX, 0x18).is_none());
+    }
+
+    #[test]
+    fn row_disabled_layout_rejects_a_changed_page_field_or_call() {
+        let mut bytes = vec![0xCC; 0x300];
+        bytes[0x7F..0x88].copy_from_slice(&[0x48, 0x8B, 0xD6, 0x48, 0x8D, 0x4C, 0x24, 0x40, 0xE8]);
+        bytes[0x88..0x8C].copy_from_slice(&(0x180i32 - 0x8C).to_le_bytes());
+        let helper = [
+            0x48, 0x89, 0x5C, 0x24, 0x10, 0x44, 0x89, 0x44, 0x24, 0x18,
+            0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+            0x48, 0x8D, 0x6C, 0x24, 0xD9, 0x48, 0x81, 0xEC, 0x90, 0, 0, 0,
+            0x44, 0x8B, 0x72, 0x18,
+        ];
+        bytes[0x180..0x180 + helper.len()].copy_from_slice(&helper);
+        let image = FileImage::from_code(&bytes);
+        assert_eq!(row_disabled_offset(&image, 0), Some(0x18));
+        for at in [0x87, 0x180 + helper.len() - 1] {
+            let mut changed = image.clone();
+            changed.write(at, &[0xFF]).unwrap();
+            assert_eq!(row_disabled_offset(&changed, 0), None);
+        }
+        for displacement in [i32::MIN, i32::MAX] {
+            let mut changed = image.clone();
+            changed.write(0x88, &displacement.to_le_bytes()).unwrap();
+            assert_eq!(row_disabled_offset(&changed, 0), None);
+        }
+        assert_eq!(row_disabled_offset(&FileImage::from_code(&[0; 32]), 0), None);
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly supplied executable path"]
+    fn disabled_row_matches_supplied_executable() {
+        let path = std::env::var_os("NMS_ROW_CHECK_EXE").expect("set NMS_ROW_CHECK_EXE");
+        let image = FileImage::load(std::path::Path::new(&path)).unwrap();
+        let boolean = image.find_unique(&Pattern::parse(sigs::BOOLEAN).unwrap()).unique().unwrap();
+        assert_eq!(row_disabled_offset(&image, boolean), Some(0x18));
+        println!("Read-only disabled-row check: Boolean RVA {boolean:#x}, page offset 0x18");
     }
 }
