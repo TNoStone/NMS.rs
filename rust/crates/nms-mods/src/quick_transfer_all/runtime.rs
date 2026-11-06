@@ -65,7 +65,9 @@ pub struct Runtime {
     pub mark_drop_logged: bool,
     pub lock_persist_ok: bool,
     pub lock_wallet: Option<usize>,
-    pub lock_save_id: i64,
+    /// Save id the pins were loaded for; `None` until the first load. The id is a u64: a signed
+    /// copy made ids with the top bit set look negative, and pins were never written for them.
+    pub lock_save_id: Option<u64>,
     pub persist_dir: PathBuf,
     /// Game language (locale code) for the toasts and tooltips; read once at start (`text`).
     pub lang: &'static str,
@@ -156,7 +158,7 @@ impl Runtime {
             mark_drop_logged: false,
             lock_persist_ok: false,
             lock_wallet: None,
-            lock_save_id: -1,
+            lock_save_id: None,
             lock_pins: HashMap::new(),
             lock_hits: HashMap::new(),
             lock_page: 0,

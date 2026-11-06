@@ -303,7 +303,7 @@ impl Runtime {
             return false;
         }
         let save_id = self.save_id();
-        if save_id as i64 != self.lock_save_id {
+        if self.lock_save_id != Some(save_id) {
             self.reload_pins(save_id);
         }
         !self.lock_pins.is_empty()

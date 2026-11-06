@@ -249,6 +249,35 @@ fn info(msg: &str) {
     }
 }
 
+/// Check the close code inside the text popup's `Update` (`sigs::TEXT_CLOSE_AT`) and read the two
+/// addresses it names: the application global and the "switch action set" routine (both as VAs).
+pub fn text_close_code(image: &ProcessImage, update: usize) -> Result<(usize, usize), String> {
+    let close = update + sigs::TEXT_CLOSE_AT;
+    let len = sigs::TEXT_CLOSE_LEN;
+    let code = image.read(close, len).ok_or("text popup update unreadable")?;
+    let fixed = |range: std::ops::Range<usize>, want: &[u8]| code.get(range).is_some_and(|b| b == want);
+    let ctl = sigs::TEXT_CLOSE_CONTROLLER_AT;
+    let sets = sigs::TEXT_CLOSE_SETS_AT;
+    let call = sigs::TEXT_CLOSE_CALL_AT;
+    // mov rax,[rip+app]; mov r8b,1; mov edx,r15d; mov rcx,[rax+ctl]; mov [rcx+0x40],r13b;
+    // add rcx,sets; call set_actions
+    if !(code.len() == len
+        && call + 5 == len
+        && fixed(0..3, &[0x48, 0x8B, 0x05])
+        && fixed(7..ctl, &[0x41, 0xB0, 0x01, 0x41, 0x8B, 0xD7, 0x48, 0x8B, 0x88])
+        && code.get(ctl..ctl + 4).is_some_and(super::context::controller_disp_matches)
+        && fixed(ctl + 4..sets - 3, &[0x44, 0x88, 0x69, 0x40])
+        && fixed(sets - 3..sets, &[0x48, 0x81, 0xC1])
+        && fixed(sets..sets + 4, &sigs::CONTROLLER_SETS.to_le_bytes()[..])
+        && code.get(call) == Some(&0xE8))
+    {
+        return Err("text popup close code changed (game update?)".into());
+    }
+    let app = rip_target(image, close, 3, 7).ok_or("application pointer unreadable")?;
+    let rel = i32::from_le_bytes([code[call + 1], code[call + 2], code[call + 3], code[call + 4]]);
+    Ok((app, (image.va(close + len) as i64 + i64::from(rel)) as usize))
+}
+
 /// Where a `mov`/`cmp` with a RIP displacement points: `rva` is the instruction, `disp_at` the
 /// displacement offset in it, `len` the instruction length.
 fn rip_target(image: &ProcessImage, rva: usize, disp_at: usize, len: usize) -> Option<usize> {
@@ -345,23 +374,9 @@ fn install_text(image: &ProcessImage) -> Result<(), String> {
     let update = find(image, "text popup update", sigs::TEXT_UPDATE)?;
     // The code at the end of `Update` that gives the keyboard back to the game: it names the
     // application global and the "switch action set" routine we need to undo a popup that is left open.
-    let close = update + sigs::TEXT_CLOSE_AT;
-    let code = image.read(close, sigs::TEXT_CLOSE_LEN).ok_or("text popup update unreadable")?;
-    let fixed = |range: std::ops::Range<usize>, want: &[u8]| code.get(range).is_some_and(|b| b == want);
-    if !(code.len() >= 38
-        && fixed(0..3, &[0x48, 0x8B, 0x05])
-        && fixed(7..18, &[0x41, 0xB0, 0x01, 0xBA, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x88])
-        && code.get(18..22).is_some_and(super::context::controller_disp_matches)
-        && fixed(22..26, &[0x44, 0x88, 0x61, 0x40])
-        && fixed(26..29, &[0x48, 0x81, 0xC1])
-        && fixed(29..33, &sigs::CONTROLLER_SETS.to_le_bytes()[..])
-        && code.get(33) == Some(&0xE8))
-    {
-        return Err("text popup close code changed (game update?)".into());
-    }
-    APP_GLOBAL.store(rip_target(image, close, 3, 7).ok_or("application pointer unreadable")?, Ordering::Release);
-    let rel = i32::from_le_bytes([code[34], code[35], code[36], code[37]]);
-    SET_ACTIONS.store((image.va(close + 38) as i64 + i64::from(rel)) as usize, Ordering::Release);
+    let (app_global, set_actions) = text_close_code(image, update)?;
+    APP_GLOBAL.store(app_global, Ordering::Release);
+    SET_ACTIONS.store(set_actions, Ordering::Release);
     text_input_update::subscribe(image, sigs::TEXT_UPDATE, None, Some(on_text_update))?;
     // Give held input back from the core's per-frame tick too, so it can never stay off in a game
     // state that does not run the text box update. Optional: the text update still does it.

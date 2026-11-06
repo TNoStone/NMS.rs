@@ -157,8 +157,9 @@ fn merge_ui(log: &Log, loader: &Path, run_child: impl FnOnce(Command) -> io::Res
                 log.info("UI merge finished.");
             } else {
                 match out.status.code() {
-                    Some(code) => log.info(&format!("UI merge failed: exit {code}.")),
-                    None => log.info("UI merge failed: child exited without a status."),
+                    // Exit 1 is any problem prepare listed above (two loader files, say), not only a failed merge.
+                    Some(code) => log.info(&format!("prepare reported a problem (exit {code}), see the prepare lines above.")),
+                    None => log.info("prepare ended without an exit status."),
                 }
             }
         }
@@ -254,7 +255,7 @@ mod tests {
         let text = fs::read_to_string(&log_path).unwrap();
         assert!(text.contains("prepare: stdout line"), "{text}");
         assert!(text.contains("prepare: stderr line"), "{text}");
-        assert!(text.contains("UI merge failed: exit 1."), "{text}");
+        assert!(text.contains("prepare reported a problem (exit 1)"), "{text}");
         assert!(!text.contains("UI merge finished."), "{text}");
         let _ = fs::remove_dir_all(&loader);
     }

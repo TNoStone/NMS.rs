@@ -46,26 +46,9 @@ pub fn locate(image: &ProcessImage) -> Result<(), String> {
     let result = find(image, "text popup result", sigs::TEXT_RESULT)?;
     let stop = find(image, "text popup stop", sigs::TEXT_STOP)?;
     let update = find(image, "text popup update", sigs::TEXT_UPDATE)?;
-    let close = update + sigs::TEXT_CLOSE_AT;
-    let code = image.read(close, sigs::TEXT_CLOSE_LEN).ok_or("text popup update unreadable")?;
-    if code.len() < 38 {
-        return Err("text popup update unreadable".into());
-    }
-    let fixed = |range: std::ops::Range<usize>, want: &[u8]| code.get(range).is_some_and(|b| b == want);
-    if !(fixed(0..3, &[0x48, 0x8B, 0x05])
-        && fixed(7..18, &[0x41, 0xB0, 0x01, 0xBA, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x88])
-        && code.get(18..22).is_some_and(context::controller_disp_matches)
-        && fixed(22..26, &[0x44, 0x88, 0x61, 0x40])
-        && fixed(26..29, &[0x48, 0x81, 0xC1])
-        && fixed(29..33, &sigs::CONTROLLER_SETS.to_le_bytes()[..])
-        && code.get(33) == Some(&0xE8))
-    {
-        return Err("text popup close code changed (game update?)".into());
-    }
-    let disp = i32::from_le_bytes([code[3], code[4], code[5], code[6]]);
-    let rel = i32::from_le_bytes([code[34], code[35], code[36], code[37]]);
-    APP_GLOBAL.store((image.va(close + 7) as i64 + i64::from(disp)) as usize, Ordering::Release);
-    SET_ACTIONS.store((image.va(close + 38) as i64 + i64::from(rel)) as usize, Ordering::Release);
+    let (app_global, set_actions) = crate::common::options_menu::text_close_code(image, update)?;
+    APP_GLOBAL.store(app_global, Ordering::Release);
+    SET_ACTIONS.store(set_actions, Ordering::Release);
     START.store(image.va(start), Ordering::Release);
     RESULT.store(image.va(result), Ordering::Release);
     STOP.store(image.va(stop), Ordering::Release);

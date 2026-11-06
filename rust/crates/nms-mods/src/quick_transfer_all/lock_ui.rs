@@ -149,7 +149,7 @@ impl Runtime {
 
     pub fn reload_pins(&mut self, save_id: u64) {
         self.follow_reset(true);
-        self.lock_save_id = save_id as i64;
+        self.lock_save_id = Some(save_id);
         self.lock_pins.clear();
         if !self.lock_persist_ok {
             if !self.lock_persist_note {
@@ -218,11 +218,12 @@ impl Runtime {
     }
 
     pub fn write_pins(&self) {
-        let save_id = self.lock_save_id;
-        if !self.lock_persist_ok || save_id <= 0 {
+        let Some(save_id) = self.lock_save_id.filter(|&id| id != 0) else {
+            return;
+        };
+        if !self.lock_persist_ok {
             return;
         }
-        let save_id = save_id as u64;
         let path = self.persist_dir.join(format!("suit_lock_{save_id:016x}.json"));
         let mut pins = Vec::new();
         let mut keys: Vec<_> = self.lock_pins.keys().copied().collect();
@@ -470,7 +471,7 @@ impl Runtime {
             }
             if self.suit_lock {
                 let save_id = self.save_id();
-                if save_id as i64 != self.lock_save_id {
+                if self.lock_save_id != Some(save_id) {
                     self.reload_pins(save_id);
                 }
             }
@@ -820,4 +821,47 @@ fn hex_nibble(b: u8) -> Result<u8, ()> {
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::inv::Pin;
+    use super::Runtime;
+    use nms_core::log::Log;
+    use std::sync::Arc;
+
+    fn runtime(dir: &std::path::Path) -> Runtime {
+        let mut rt = Runtime::new(Arc::new(Log::disabled()), dir.to_path_buf());
+        rt.lock_persist_ok = true;
+        rt
+    }
+
+    /// Save ids with the top bit set (about half of all saves) once looked negative, so pins were
+    /// never written and every start reloaded an old file.
+    #[test]
+    fn pins_survive_a_restart_for_a_top_bit_save_id() {
+        let dir = std::env::temp_dir().join(format!("nmsrs-pins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = 0xe06c_bd2e_0551_92b1u64;
+
+        let mut rt = runtime(&dir);
+        rt.reload_pins(id);
+        rt.lock_pins.insert((0, 2, 1), Pin { id: *b"ULTRAPRODX40\0\0\0\0", kind: 2, count: 7 });
+        rt.write_pins();
+        assert!(dir.join(format!("suit_lock_{id:016x}.json")).is_file());
+
+        let mut again = runtime(&dir);
+        again.reload_pins(id);
+        let pin = again.lock_pins.get(&(0, 2, 1)).expect("pin reloaded");
+        assert_eq!((pin.kind, pin.count), (2, 7));
+
+        // No save: nothing is written.
+        let mut none = runtime(&dir);
+        none.reload_pins(0);
+        none.lock_pins.insert((0, 0, 0), Pin { id: [1; 16], kind: 2, count: 1 });
+        none.write_pins();
+        assert!(!dir.join(format!("suit_lock_{:016x}.json", 0)).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

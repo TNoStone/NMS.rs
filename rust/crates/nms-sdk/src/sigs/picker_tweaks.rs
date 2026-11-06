@@ -35,8 +35,9 @@ pub const SUBSTANCE_LOOKUP: &str = "48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20
 /// `0x142C40F80(table, key, 0) -> utf8`: localisation lookup. Copies the key to its own stack,
 /// upper-cases it, finds it in the table; returns the key pointer itself when the id is unknown.
 pub const LOC_LOOKUP: &str = "48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 40 0F 57 C0";
-/// `0x1401CEC20() -> table`: the localisation table (a function-local static, built at boot).
-pub const LOC_TABLE: &str = "48 83 EC 28 65 48 8B 04 25 58 00 00 00 B9 28 1B 00 00 48 8B 00 8B 04 01 39 05 ? ? ? ? 0F 8F ? ? ? ? \
+/// `0x1401CEC30() -> table`: the localisation table (a function-local static, built at boot). The
+/// thread-local offset in it is `0x1D48` on build 184271 (`0x1B28` before).
+pub const LOC_TABLE: &str = "48 83 EC 28 65 48 8B 04 25 58 00 00 00 B9 48 1D 00 00 48 8B 00 8B 04 01 39 05 ? ? ? ? 0F 8F ? ? ? ? \
 48 8D 05 ? ? ? ? 48 83 C4 28 C3 4C 89 00 4C 89 40 08 4C 89 40 10 48 8D 40 40";
 
 /// `0x140EE3C60(app+0x60, id, bool make) -> record`: technology lookup. Called with `make = 0` only:
@@ -44,11 +45,11 @@ pub const LOC_TABLE: &str = "48 83 EC 28 65 48 8B 04 25 58 00 00 00 B9 28 1B 00 
 /// key the technology card draws is at record `+0x50` (`0x1406A490C`).
 pub const TECH_LOOKUP: &str = "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 30 48 8B F1 41 0F B6 E8 48 81 C1 40 03 00 00";
 
-/// `0x1409152F0(host)`: the frontend page host, once per frame while a menu page is up. Located,
+/// `0x1409172D0(host)`: the frontend page host, once per frame while a menu page is up. Located,
 /// never hooked: the input shield reads three things out of it.
-/// Ends in `add rcx, 0x1EE50` (`0x1EDD0` before build 183791).
-pub const PAGE_HOST: &str = "48 8B C4 55 53 56 57 41 54 48 8D 68 B8 48 81 EC 20 01 00 00 4C 89 68 D0 48 8B F9 4C 89 70 C8 48 81 C1 50 EE 01 00";
-/// In `PAGE_HOST`: `call <frontend input builder>` (`0x140204570`), which fills the frame's
+/// Ends in `add rcx, 0x1EF60` on build 184271 (`0x1EE50` on 183791, `0x1EDD0` before).
+pub const PAGE_HOST: &str = "48 8B C4 55 53 56 57 41 54 48 8D 68 B8 48 81 EC 20 01 00 00 4C 89 68 D0 48 8B F9 4C 89 70 C8 48 81 C1 60 EF 01 00";
+/// In `PAGE_HOST`: `call <frontend input builder>` (`0x140204590`), which fills the frame's
 /// button states from the action table.
 pub const HOST_BUILD_CALL_AT: usize = 0x336;
 /// In `PAGE_HOST`: `mov [rip+G], r12`, the pointer every page reads the frame's input state through.
@@ -61,10 +62,10 @@ pub const HOST_UPDATE_CALL_AT: usize = 0x480;
 pub const HOST_UPDATE_CALL: [u8; 7] = [0x48, 0x8D, 0x8F, 0xE8, 0x08, 0x00, 0x00];
 /// In the input builder: `mov dword [rbx+0x34], 2` (Fe_Select pressed) and `mov [rbx+0x50], r15d`
 /// (the last button state written): the button states are the 8 dwords at `+0x34..+0x54`
-/// (`+0x130E` and `+0x15E9` before build 183791).
-pub const BUILD_SELECT_AT: usize = 0x131C;
+/// (`+0x131C` and `+0x15F7` on 183791 and 183877, `+0x130E` and `+0x15E9` before).
+pub const BUILD_SELECT_AT: usize = 0x1350;
 pub const BUILD_SELECT: [u8; 7] = [0xC7, 0x43, 0x34, 0x02, 0x00, 0x00, 0x00];
-pub const BUILD_LAST_AT: usize = 0x15F7;
+pub const BUILD_LAST_AT: usize = 0x162B;
 pub const BUILD_LAST: [u8; 4] = [0x44, 0x89, 0x7B, 0x50];
 
 /// `0x142CA9BC0(device, f32 x, f32 y)`: the mouse device's own "put the cursor here" (device vtable

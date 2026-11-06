@@ -5,20 +5,21 @@
 
 use crate::{ModSigs, Sig, SigUse};
 
-/// `RemovePart(tool, handle: u32, mode: i32) -> bool` `0x1403D50C0`: every Move and Delete of a base or
-/// corvette part ends here. Three register arguments (`rcx`, `edx`, `r8d`), no stack arguments (only the
-/// shadow homes above the return address). Returns 1 on success, 0 when refused (the vanilla refusals
-/// return 0 before anything is changed). 31 bytes, 1 hit.
-pub const REMOVE_PART: &str =
-    "48 89 5C 24 10 44 89 44 24 18 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 80";
+/// `RemovePart(tool, handle: u32, mode: i32) -> bool` `0x1403D53E0` (build 184271): every Move and Delete
+/// of a base or corvette part ends here. Three register arguments (`rcx`, `edx`, `r8d`), no stack arguments
+/// (only the shadow homes above the return address; re-read on 184271, where the frame shrank by 0x10).
+/// Returns 1 on success, 0 when refused (the vanilla refusals return 0 before anything is changed). The
+/// frame sizes are wildcards; 1 hit on 183877 and 184271.
+pub const REMOVE_PART: &str = "48 89 5C 24 10 44 89 44 24 18 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ? 48 81 EC ? ? ? ? 44 0F 29 9C 24 ? ? ? ? 8B DA 48 8B F1 45 33 FF E8";
 
-/// Inside `RemovePart` (`0x1403D56B9`): `xor eax,eax; lea rdx,[rbp-0x40]; mov ecx,ebx; mov [rbp-0x40],rax;
-/// call MaintLookup; mov rcx,[rbp-0x40]; test rcx,rcx; je; mov rax,[rcx]; call [rax+0xE0]`. The call is the
-/// lookup the game itself uses to find the machine it then clears (slot 28). 1 hit.
+/// Inside `RemovePart` (`0x1403D5A5B`): `xor eax,eax; lea rdx,[rsp+0x50]; mov ecx,ebx; mov [rsp+0x50],rax;
+/// call MaintLookup; mov rcx,[rsp+0x50]; test rcx,rcx; je; mov rax,[rcx]; call [rax+0xE0]` (the local was
+/// `[rbp-0x40]` before build 184271). The call is the lookup the game itself uses to find the machine it
+/// then clears (slot 28). 1 hit.
 pub const MAINT_SITE: &str =
-    "33 C0 48 8D 55 C0 8B CB 48 89 45 C0 E8 ? ? ? ? 48 8B 4D C0 48 85 C9 74 09 48 8B 01 FF 90 E0 00 00 00";
+    "33 C0 48 8D 54 24 ? 8B CB 48 89 44 24 ? E8 ? ? ? ? 48 8B 4C 24 ? 48 85 C9 74 09 48 8B 01 FF 90 E0 00 00 00";
 /// Offset of the `E8` of the lookup call inside `MAINT_SITE`.
-pub const MAINT_SITE_CALL: usize = 12;
+pub const MAINT_SITE_CALL: usize = 14;
 
 /// First bytes of `MaintLookup(handle: u32, out: *mut comp) -> u32` `0x1403E3300` (a template instance,
 /// the prologue alone hits many times, so it is reached through `MAINT_SITE` and only checked here). Pure:

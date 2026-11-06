@@ -84,7 +84,7 @@ RUST_README = (
     "1. Run NMS.rs\\nms-rs.exe once to open the manager. Install the mods you want,\n"
     "   park the ones you do not, and pick your grid and slot sizes.\n"
     "2. Press Play in Steam. No launch option is needed.\n\n"
-    "Coming from version 3 (NMS.py)? The manager finds the old setup and asks first.\n"
+    "If you used version 3 (NMS.py), the manager finds the old setup and asks first.\n"
     "Migrate now backs up your settings to NMS.rs\\backup, then removes the old Python\n"
     "files, the old Steam launch option and the NMS.py folder. Your mod settings stay.\n\n"
     "Mod folders in NMS.rs\\stock are the copies the manager installs from.\n"
@@ -93,14 +93,14 @@ RUST_README = (
     "WINEDLLOVERRIDES=\"xinput9_1_0=n,b\" %command%\n"
     "Without it the game starts but the mods do not load. If anything fails, use Pack logs in\n"
     "the manager's Settings tab and send the zip.\n"
-    "\nAnother mod already uses Binaries\\xinput9_1_0.dll? Keep that file, and get the NMS.rs\n"
+    "\nIf another mod already uses Binaries\\xinput9_1_0.dll, keep that file and get the NMS.rs\n"
     "\"DLL only\" file named winmm or version from the Nexus page instead (see its README).\n"
 )
 # README of the "DLL only" zips. {dll}: winmm.dll; {stem}: winmm.
 VARIANT_README = (
     "NMS.rs {version}: loader DLL as Binaries\\{dll}\n\n"
-    "Only for players whose Binaries\\xinput9_1_0.dll belongs to another mod. This is the same\n"
-    "NMS.rs loader as the main file, under a different name that No Man's Sky also loads.\n\n"
+    "This file is only for players whose Binaries\\xinput9_1_0.dll belongs to another mod. It is\n"
+    "the same NMS.rs loader as the main file, under a different name that No Man's Sky also loads.\n\n"
     "1. Install the main NMS.rs {version} zip first, but keep the other mod's\n"
     "   Binaries\\xinput9_1_0.dll (do not let the main zip replace it).\n"
     "2. Extract this zip into the game folder, so that Binaries\\{dll} lands next to NMS.exe.\n"

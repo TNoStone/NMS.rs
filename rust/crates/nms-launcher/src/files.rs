@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
-pub const MADE_FOR: &str = "183877";
+pub const MADE_FOR: &str = "184271";
 const COMBINED_NAME: &str = "z_Combined Mods";
 const MARKER: &[u8] = b"svn.hellogames.dev";
 

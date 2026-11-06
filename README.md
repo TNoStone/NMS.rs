@@ -5,11 +5,11 @@ A small proxy DLL loads the mods when the game starts, so there is no injector, 
 on Windows, no Steam launch option. A separate manager (`nms-rs.exe`) installs, updates and parks
 the mods, rebuilds the inventory sizes and merges UI scripts with other people's AMUMSS mods.
 
-Every change to game behaviour is a live switch on the in-game Mods page (Options, then Mods).
-Every patch is found by a unique byte signature and checked before it is written: if the game
+Each change to game behaviour is a live switch on the in-game Mods page (Options, then Mods).
+Patches are found by a unique byte signature and checked before they are written. If the game
 code moved after an update, that part stays off and the game stays vanilla.
 
-Targets game build **183877**. Version 4.0.4.
+Version 4.0.5, for game build 184271.
 
 ## Mods
 
@@ -36,7 +36,7 @@ Each mod folder under [`mods/`](mods) has a README.txt with every switch and its
 ## Install (players)
 
 Download the zip from the Nexus Mods page:
-**https://www.nexusmods.com/nomanssky/mods/4600**
+https://www.nexusmods.com/nomanssky/mods/4600
 
 1. Extract the zip into your No Man's Sky game folder (the one with `Binaries` and `GAMEDATA`).
 2. Run `NMS.rs\nms-rs.exe`, install the mods you want and pick your sizes.
@@ -45,13 +45,13 @@ Download the zip from the Nexus Mods page:
 Linux and Steam Deck (Proton, beta) need one launch option, shown in the manager:
 `WINEDLLOVERRIDES="xinput9_1_0=n,b" %command%`.
 
-Coming from version 3 (NMS.py)? The manager offers to migrate and backs everything up first.
+If you used version 3 (NMS.py), the manager offers to migrate and backs everything up first.
 Close the old NMS.py Mod Manager window before you press Migrate now. More in [docs/players.md](docs/players.md).
 
 ## Build from source (Windows)
 
 Needs [Rust](https://rustup.rs) (stable, MSVC toolchain) and Python 3.9 or newer from python.org
-(only for the zip script and the asset scripts; nothing else in Python).
+(used only by the zip script and the asset scripts).
 
 ```
 git clone https://github.com/skythebro/NMS.rs.git
@@ -59,8 +59,8 @@ cd NMS.rs\rust
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cd ..
-py -3 release.py rust-build --version 4.0.4
-py -3 release.py rust --version 4.0.4 --out %TEMP%\nmsrs-zip
+py -3 release.py rust-build --version 4.0.5
+py -3 release.py rust --version 4.0.5 --out %TEMP%\nmsrs-zip
 ```
 
 `rust-build` builds `nms-rs.exe` and `xinput9_1_0.dll` with the `dist` profile (no debug info, no

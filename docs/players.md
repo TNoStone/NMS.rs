@@ -8,8 +8,8 @@
 3. Run `NMS.rs\nms-rs.exe`. This is the manager. Install the mods you want and pick your sizes.
 4. Press Play in Steam (or Play in the manager). No launch option is needed on Windows.
 
-Every mod arrives parked: its files wait in `NMS.rs\stock` until you click Install. GOG and other
-stores: the loader starts with any copy of the game, but only Steam is tested.
+Every mod arrives parked: its files wait in `NMS.rs\stock` until you click Install. On GOG and
+other stores the loader starts with any copy of the game, but only Steam is tested.
 
 ### Another mod already uses `Binaries\xinput9_1_0.dll`
 
@@ -17,8 +17,8 @@ Only one file can have that name. Keep the other mod's file (do not let the NMS.
 it), then also download one "DLL only" file from the Nexus page and extract it into the game
 folder:
 
-- `NMS.rs-<version>-winmm.zip` puts the loader in `Binaries\winmm.dll`. Not together with Snap
-  Angles' own `winmm.dll` version: only one of the two can be there.
+- `NMS.rs-<version>-winmm.zip` puts the loader in `Binaries\winmm.dll`. Do not use it together
+  with Snap Angles' own `winmm.dll` version; only one of the two can be there.
 - `NMS.rs-<version>-version.zip` puts it in `Binaries\version.dll`.
 
 Keep one NMS.rs loader file in `Binaries`. With two, only the first one runs the mods and the
@@ -37,13 +37,13 @@ Without it the game starts but the mods do not load. The manager shows this line
 
 ## The manager (nms-rs.exe)
 
-- **Mods**: one card per mod with a live, parked or update dot and an on/off switch. Install
+- Mods: one card per mod with a live, parked or update dot and an on/off switch. Install
   copies a mod from `NMS.rs\stock` into `GAMEDATA\MODS\<Mod>`; Park moves it to `NMS.rs\parked`
   so the game no longer sees it. Update (or Update all) refreshes a mod from stock and keeps any
   file you edited yourself.
-- **Sizes**: the grid size of Bigger Item Grids and the slot size of Smaller Inventory Slots.
+- Sizes: the grid size of Bigger Item Grids and the slot size of Smaller Inventory Slots.
   See [Sizes](#sizes).
-- **Settings**: language, text size, Pack logs (zips the logs for a bug report), Open logs
+- Settings: language, text size, Pack logs (zips the logs for a bug report), Open logs
   folder, migration from version 3 and clean-up of old Python files.
 
 The manager does not need to stay open while you play. Close the game before installing,
@@ -61,7 +61,7 @@ writes its own defaults on first start, and your settings are never overwritten 
 A mod that is parked (its folder is not in `GAMEDATA\MODS`) is off: its code does not hook the
 game, and the page shows "Off: parked". Install it in the manager to turn it on.
 
-The **NMS.rs** section has the loader's own switch, **Hide mod warning** (on by default): it skips
+The NMS.rs section has the loader's own switch, Hide mod warning (on by default), which skips
 the game's "You appear to be running a modded version" screen at start. The tamper warning and the
 crash dialog's Disable Mods button stay as in vanilla.
 
@@ -102,7 +102,7 @@ Many UI mods ship an AMUMSS lua script. When the game starts, NMS.rs merges ever
 ## Coming from version 3 (NMS.py)
 
 The manager finds an old NMS.py setup and asks first. Close the old NMS.py Mod Manager window
-before you press **Migrate now** (the manager waits while it is open). **Migrate now**:
+before you press Migrate now; the manager waits while it is open. Migrate now then:
 
 1. backs up your settings and edited files to `NMS.rs\backup\migrate-<time>`;
 2. carries the language, merge order, sizes and parked mods over to `NMS.rs`;
@@ -110,9 +110,9 @@ before you press **Migrate now** (the manager waits while it is open). **Migrate
 4. removes the old Python mod files, the old Steam launch option and the `NMS.py` folder.
 
 Your mod settings, edited lua files and other people's mods are kept. Running it again finds
-nothing and says so. The same is in Settings and as `nms-rs migrate`. While a mod's old `.py` file
-is still in its folder, NMS.rs leaves that mod off (status "Python copy present"), so the two
-loaders never hook the same function.
+nothing and says so. Migration is also in Settings, and on the command line as `nms-rs migrate`.
+While a mod's old `.py` file is still in its folder, NMS.rs leaves that mod off (status "Python
+copy present"), so the two loaders never hook the same function.
 
 ## After a game update
 

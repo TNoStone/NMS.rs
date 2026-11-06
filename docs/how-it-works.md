@@ -31,22 +31,22 @@ folder, so the old and new loader never hook the same function.
 
 ## Signatures, patches and hooks
 
-- **No hard-coded addresses.** Every function or patch site is found by a byte pattern with
+- No address is hard-coded. Every function or patch site is found by a byte pattern with
   wildcards, listed per mod in `crates/nms-sdk/src/sigs`. A pattern must match exactly once; no
   match or two matches means "not found", and that part of the mod stays off.
-- **Byte patches fail closed.** A patch is written only when the bytes at the site are exactly the
+- Byte patches fail closed. A patch is written only when the bytes at the site are exactly the
   expected original. Once written, it is found again by its patched bytes, so the same call can
   undo it. Any other state logs "not changed" and leaves the game vanilla.
-- **Hooks are installed once.** Enabling or disabling a detour while the game runs is not safe
+- Hooks are installed once. Enabling or disabling a detour while the game runs is not safe
   (other threads may be inside the prologue), so a switch is an atomic flag the detour checks. A
   detour declares every argument the game function takes, stack arguments included, and forwards
   them all. Code reachable from a detour never panics (`panic = "abort"` in release builds) and
   takes locks with `try_lock`.
-- **Shared hooks.** When two mods need the same function, it gets one detour through
+- When two mods need the same function, it gets one detour through
   `nms_core::shared_hook!` (`crates/nms-mods/src/common/hooks.rs`) and each mod subscribes to it.
   Two detours on one prologue are never allowed.
-- **rel32 operands.** For an `E8`/`E9` call or jump, the displacement starts at the byte after the
-  opcode and is relative to the end of the instruction.
+- For an `E8`/`E9` call or jump, the rel32 displacement starts at the byte after the opcode and
+  is relative to the end of the instruction.
 
 `sigcheck` checks all of this offline against an `NMS.exe`: every signature unique, every patch
 site holding the expected bytes, and no two mods hooking one function entry unless it is in the

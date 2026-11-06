@@ -38,13 +38,13 @@ collects `nms-rs.exe`, the DLL, `NMS.rs/stock/<Mod>/...` for every mod in `RUST_
 
 ## Adding or changing a mod
 
-1. **Signatures** go in a new `crates/nms-sdk/src/sigs/<mod>.rs` table, listed in `ALL` in
+1. Signatures go in a new `crates/nms-sdk/src/sigs/<mod>.rs` table, listed in `ALL` in
    `sigs/mod.rs`. Each pattern must hit exactly once; check with `sigcheck`. A function two mods
    hook must use a shared hook and be listed in `SHARED` in `crates/sigcheck/src/lib.rs`.
-2. **Code** goes in `crates/nms-mods/src/<mod>.rs` (or a folder), implementing
+2. Code goes in `crates/nms-mods/src/<mod>.rs` (or a folder), implementing
    `nms_core::GameMod` (`name`, `specs`, `get`, `set`, optional `range` and `default_value`), and
    is registered in `MODS` in `crates/nms-mods/src/lib.rs`.
-3. **Rules**, all of them hard:
+3. Follow every one of these rules:
    - find code by unique pattern only, never by address;
    - check the bytes before writing a patch, undo it the same way, and leave the game vanilla on
      any mismatch;
@@ -58,11 +58,11 @@ collects `nms-rs.exe`, the DLL, `NMS.rs/stock/<Mod>/...` for every mod in `RUST_
    - log state changes once, not every frame.
    Use the helpers in `crates/nms-mods/src/common` (shared hooks, code caves, rel32, input,
    toasts) instead of new copies.
-4. **Strings**: setting labels and descriptions for the in-game Mods page go in
+4. Setting labels and descriptions for the in-game Mods page go in
    `crates/nms-mods/src/common/menu_strings/en.json` first, then every other language file.
    `py -3 dev\menu_strings_check.py` lists missing keys. Manager strings (including the one-line
    `mod.<Name>` card description) are in `loader/locales/*.json`.
-5. **Files**: a mod that ships game files or a lua script gets a `mods/<Mod>/` folder with a
+5. A mod that ships game files or a lua script gets a `mods/<Mod>/` folder with a
    `README.txt`, and its name in `RUST_STOCK_MODS` in `release.py`.
 
 ## UI mods and presets
