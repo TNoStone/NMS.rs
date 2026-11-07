@@ -304,8 +304,8 @@ pub fn install(image: &ProcessImage, registry: Arc<Registry>, log: Arc<Log>) {
     }
     let _ = REGISTRY.set(registry.clone());
     let _ = LOG.set(log.clone());
-    let boolean = BOOLEAN.load(Ordering::Acquire) - image.base();
-    match row_disabled_offset(image, boolean) {
+    let boolean = BOOLEAN.load(Ordering::Acquire).checked_sub(image.base());
+    match boolean.and_then(|b| row_disabled_offset(image, b)) {
         Some(offset) => {
             ROW_DISABLED_OFFSET.store(offset, Ordering::Release);
             log.info("in-game Mods menu: native disabled text-row styling ready");
@@ -396,20 +396,17 @@ fn install_text(image: &ProcessImage) -> Result<(), String> {
     Ok(())
 }
 
-/// BOOLEAN calls this native helper with the page in RDX. Check its call and page+0x18 load
-/// before using the disabled state that selects DISABLE/DISABLED and skips click tests.
+/// BOOLEAN calls the row helper (`sigs::ROW_HELPER`) with the page in RDX. Check that call and that
+/// it lands on the one helper that loads the page's disabled flag before using that flag, which
+/// draws the row greyed out and skips its click test.
 fn row_disabled_offset(image: &dyn Code, boolean: usize) -> Option<usize> {
-    if image.read(boolean + 0x7F, 9)?.as_slice() != [0x48, 0x8B, 0xD6, 0x48, 0x8D, 0x4C, 0x24, 0x40, 0xE8] {
+    let at = boolean.checked_add(sigs::BOOLEAN_ROW_CALL_AT)?;
+    if image.read(at, sigs::BOOLEAN_ROW_CALL.len())?.as_slice() != sigs::BOOLEAN_ROW_CALL {
         return None;
     }
-    let helper = image.rel32_target(boolean + 0x88)?;
-    let expected = [
-        0x48, 0x89, 0x5C, 0x24, 0x10, 0x44, 0x89, 0x44, 0x24, 0x18,
-        0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
-        0x48, 0x8D, 0x6C, 0x24, 0xD9, 0x48, 0x81, 0xEC, 0x90, 0, 0, 0,
-        0x44, 0x8B, 0x72, 0x18,
-    ];
-    (image.read(helper, expected.len())?.as_slice() == expected).then_some(0x18)
+    let helper = image.rel32_target(at + sigs::BOOLEAN_ROW_CALL.len())?;
+    let pattern = Pattern::parse(sigs::ROW_HELPER).ok()?;
+    (image.find_unique(&pattern).unique()? == helper).then_some(sigs::ROW_DISABLED)
 }
 
 /// Restore the page's previous disabled state immediately after one synchronous widget call.

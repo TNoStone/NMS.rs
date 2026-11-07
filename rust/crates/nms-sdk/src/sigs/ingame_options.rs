@@ -67,6 +67,17 @@ pub const CONTROLLER_SETS: u32 = 0x1770;
 /// before).
 pub const OPTIONS_BACK: &str = "48 89 5C 24 08 57 48 83 EC 20 48 8B 1D ? ? ? ? 0F B6 F9 8B 83 A8 BE 89 00 85 C0 74 0E";
 
+/// In `BOOLEAN` at this byte: `mov rdx,rsi; lea rcx,[rsp+0x40]; call <row helper>` (the page in rdx).
+pub const BOOLEAN_ROW_CALL_AT: usize = 0x7F;
+pub const BOOLEAN_ROW_CALL: [u8; 9] = [0x48, 0x8B, 0xD6, 0x48, 0x8D, 0x4C, 0x24, 0x40, 0xE8];
+/// The row helper `BOOLEAN` calls (`0x1401B8830`, build 184271). Its pattern ends in
+/// `mov r14d,[rdx+0x18]`: the page's disabled flag, which draws the row greyed out and skips its
+/// click test. Reached through `BOOLEAN_ROW_CALL` and only checked here. 1 hit.
+pub const ROW_HELPER: &str =
+    "48 89 5C 24 10 44 89 44 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ? 48 81 EC ? ? ? ? 44 8B 72 18";
+/// Offset of the disabled flag (u32) in the Options page, the disp8 at the end of `ROW_HELPER`.
+pub const ROW_DISABLED: usize = 0x18;
+
 /// `cmp dword [rip+disp32], imm8`: the page stack count. Displacement at byte 2, instruction 7 long.
 pub const STACK_COUNT: &str = "83 3D ? ? ? ? ? 0F 84 ? ? ? ? 48 89 9C 24 ? ? ? ? 48 8D 4C 24";
 /// `mov rax, [rip+disp32]`: the page stack data pointer. Displacement at byte 3, instruction 7 long.
@@ -89,6 +100,7 @@ pub const TABLE: ModSigs = ModSigs {
         Sig { name: "HEADER", pattern: HEADER, kind: SigUse::Locate },
         Sig { name: "BUTTON", pattern: BUTTON, kind: SigUse::Locate },
         Sig { name: "BOOLEAN", pattern: BOOLEAN, kind: SigUse::Locate },
+        Sig { name: "ROW_HELPER", pattern: ROW_HELPER, kind: SigUse::Locate },
         Sig { name: "INT", pattern: INT, kind: SigUse::Locate },
         Sig { name: "FLOAT", pattern: FLOAT, kind: SigUse::Locate },
         Sig { name: "BEGIN_LIST", pattern: BEGIN_LIST, kind: SigUse::Locate },
