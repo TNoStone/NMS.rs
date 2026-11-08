@@ -76,6 +76,8 @@ struct Row {
 /// value changes.
 struct ShownText {
     value: String,
+    /// Built for the in-game page (`true`) or the main menu, which shows its own empty-value hint.
+    editable: bool,
     ptr: *const u8,
 }
 // SAFETY: the pointer refers to a leaked, never-freed byte string.
@@ -100,6 +102,10 @@ struct Ui {
     no_edit: *const u8,
     /// Hint shown in a text row whose value is empty (a plain string: it is part of the cell text).
     not_set: String,
+    /// Main menu, where text cannot be typed: the empty-value hint and the greyed-out Clear row.
+    not_set_menu: String,
+    clear_menu: *const u8,
+    clear_desc_menu: *const u8,
 }
 
 // SAFETY: the pointers refer to leaked, never-freed byte strings.
@@ -626,6 +632,9 @@ fn build(registry: &Registry, lang: &'static str) -> Built {
         clear_desc: text("clear_desc"),
         no_edit: text("no_edit"),
         not_set: menu_text::ui(lang, "not_set").to_string(),
+        not_set_menu: menu_text::ui(lang, "not_set_menu").to_string(),
+        clear_menu: text("clear_menu"),
+        clear_desc_menu: text("clear_desc_menu"),
     };
     Built { lang, ui, sections: build_sections(registry, lang) }
 }
@@ -674,7 +683,7 @@ fn build_sections(registry: &Registry, lang: &'static str) -> Vec<Section> {
                 } else {
                     std::ptr::null()
                 },
-                shown: Mutex::new(ShownText { value: String::from("\u{1}"), ptr: std::ptr::null() }),
+                shown: Mutex::new(ShownText { value: String::from("\u{1}"), editable: false, ptr: std::ptr::null() }),
             });
         }
         if !rows.is_empty() {
@@ -907,17 +916,19 @@ fn draw_text(
     // SAFETY: unique signature match of the nmspy `Boolean`.
     let boolean: BooleanFn = unsafe { std::mem::transmute(BOOLEAN.load(Ordering::Acquire)) };
     let value = shown_value.and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+    let editable = OPENED_IN_GAME.load(Ordering::Acquire);
     let ptr = {
         let Ok(mut shown) = row.shown.lock() else { return None };
-        if shown.value != value || shown.ptr.is_null() {
-            shown.ptr = leak_cstr(&cell_text(&value, &ui.not_set));
+        if shown.value != value || shown.editable != editable || shown.ptr.is_null() {
+            let hint = if editable { &ui.not_set } else { &ui.not_set_menu };
+            shown.ptr = leak_cstr(&cell_text(&value, hint));
             shown.value = value.clone();
+            shown.editable = editable;
         }
         shown.ptr
     };
     // The cell shows the value in both states; the row is shown as "off", so any click comes back as "on".
     let cell = BooleanOptions { enabled: ptr, disabled: ptr };
-    let editable = OPENED_IN_GAME.load(Ordering::Acquire);
     let desc = if editable { row.desc } else { ui.no_edit };
     // Shown as "off" (0); the default is 1 while the text differs from its default, so Reset stays enabled.
     let differs = row.default.as_ref().and_then(|d| d.as_str()).is_some_and(|d| d != value);
@@ -934,11 +945,18 @@ fn draw_text(
         }
     }
     // Cancel and "accept nothing" look the same to the game, so emptying a setting has its own row.
+    // From the main menu it is greyed out like the text row and does nothing.
     let mut cleared = None;
     if !value.trim().is_empty() && !row.clear_label.is_null() {
-        let clear = BooleanOptions { enabled: ui.clear, disabled: ui.clear };
-        let hit = unsafe { boolean(page, row.clear_label, ui.clear_desc, 0, 0, &clear) } & 1 != 0;
-        if hit && !waiting {
+        let (text, desc) = if editable { (ui.clear, ui.clear_desc) } else { (ui.clear_menu, ui.clear_desc_menu) };
+        let clear = BooleanOptions { enabled: text, disabled: text };
+        let hit = {
+            let _disabled = (!editable)
+                .then(|| DisabledRow::enter(page as usize, ROW_DISABLED_OFFSET.load(Ordering::Acquire)))
+                .flatten();
+            (unsafe { boolean(page, row.clear_label, desc, 0, 0, &clear) } & 1) != 0
+        };
+        if hit && !waiting && editable {
             info(&format!("Mods page: {} {} cleared (waiting for Apply)", row.mod_name, row.key));
             cleared = Some(json!(""));
             start_cooldown();
