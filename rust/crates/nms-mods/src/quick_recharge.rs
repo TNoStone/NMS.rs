@@ -115,11 +115,79 @@ const FUEL_NAMES: &[(&str, &str)] = &[
     ("PLANT_SNOW", "Frost Crystal"),
     ("PLANT_TOXIC", "Fungal Mould"),
     ("PLANT_RADIO", "Gamma Root"),
+    // Preserve the original setting token alongside the current game substance ID.
     ("DUST1", "Pyrite"),
+    ("DUSTY1", "Pyrite"),
 ];
 
+// Accepted in saved and manual exclusions. New toggle edits write the current game IDs.
+const LEGACY_FUEL_IDS: &[&str] = &["SODIUM", "SODIUM2", "CHARGECELL", "DUST1"];
+
+type FuelMask = u64;
+#[cfg(test)]
+const ALL_FUELS: FuelMask = (1 << FUEL_NAMES.len()) - 1;
+
+pub(crate) struct FuelGroup {
+    pub(crate) id: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) mask: FuelMask,
+}
+
+// These legacy exclusions still parse, but have no recharge targets in the stock
+// technology table for build 185034.
+const PLANTS_WITHOUT_RECHARGE_TARGETS: &[&str] = &["PLANT_HOT", "PLANT_SNOW", "PLANT_TOXIC", "PLANT_RADIO"];
+
+/// One row per selectable display name, in catalogue order. The first ID is its translation key.
+pub(crate) fn fuel_groups() -> Vec<FuelGroup> {
+    let mut groups: Vec<FuelGroup> = Vec::new();
+    for (index, &(id, name)) in FUEL_NAMES.iter().enumerate() {
+        if PLANTS_WITHOUT_RECHARGE_TARGETS.contains(&id) {
+            continue;
+        }
+        let bit = 1 << index;
+        if let Some(group) = groups.iter_mut().find(|group| group.name == name) {
+            group.mask |= bit;
+        } else {
+            groups.push(FuelGroup { id, name, mask: bit });
+        }
+    }
+    groups
+}
+
+/// Fuel groups changed on this draw, to be projected onto the shared draft.
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+pub(crate) struct FuelEdits {
+    exclude: FuelMask,
+    allow: FuelMask,
+}
+
+impl FuelEdits {
+    pub(crate) fn apply(self, live: FuelMask) -> FuelMask {
+        (live | self.exclude) & !self.allow
+    }
+
+    pub(crate) fn set_group(&mut self, group: FuelMask, excluded: bool, live: FuelMask) {
+        self.exclude &= !group;
+        self.allow &= !group;
+        if excluded && live & group != group {
+            self.exclude |= group;
+        } else if !excluded && live & group != 0 {
+            self.allow |= group;
+        }
+    }
+
+    #[cfg(test)]
+    fn reset() -> Self {
+        Self { exclude: 0, allow: ALL_FUELS }
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.exclude == 0 && self.allow == 0
+    }
+}
+
 struct FuelMaps {
-    id_norm: HashMap<String, &'static str>,
+    id_name_keys: HashMap<String, String>,
     name_ids: HashMap<String, HashSet<&'static str>>,
     name_label: HashMap<String, String>,
     name_norms: Vec<String>,
@@ -128,18 +196,18 @@ struct FuelMaps {
 fn fuel_maps() -> &'static FuelMaps {
     static MAPS: OnceLock<FuelMaps> = OnceLock::new();
     MAPS.get_or_init(|| {
-        let mut id_norm = HashMap::new();
+        let mut id_name_keys = HashMap::new();
         let mut name_ids: HashMap<String, HashSet<&'static str>> = HashMap::new();
         let mut name_label: HashMap<String, String> = HashMap::new();
         for (ident, label) in FUEL_NAMES {
-            id_norm.insert(ident.to_ascii_lowercase(), *ident);
             let key = norm_name(label);
+            id_name_keys.insert(ident.to_ascii_lowercase(), key.clone());
             name_ids.entry(key.clone()).or_default().insert(ident);
             name_label.entry(key).or_insert_with(|| (*label).to_string());
         }
         let name_norms: Vec<String> = name_label.keys().cloned().collect();
         FuelMaps {
-            id_norm,
+            id_name_keys,
             name_ids,
             name_label,
             name_norms,
@@ -201,17 +269,9 @@ fn match_fuel_token(token: &str) -> (Option<String>, HashSet<String>) {
     if raw.is_empty() {
         return (None, HashSet::new());
     }
-    let folded = raw.to_ascii_lowercase();
-    if let Some(ident) = maps.id_norm.get(&folded) {
-        let label = FUEL_NAMES
-            .iter()
-            .find(|(id, _)| *id == *ident)
-            .map(|(_, l)| (*l).to_string());
-        let mut ids = HashSet::new();
-        ids.insert((*ident).to_string());
-        return (label, ids);
-    }
-    let key = norm_name(raw);
+    // IDs and names resolve to the same fuel, even when the text matches both.
+    let key = maps.id_name_keys.get(&raw.to_ascii_lowercase()).cloned()
+        .unwrap_or_else(|| norm_name(raw));
     if let Some(ids) = maps.name_ids.get(&key) {
         let label = maps.name_label.get(&key).cloned();
         return (label, ids.iter().map(|s| (*s).to_string()).collect());
@@ -283,6 +343,53 @@ fn parse_never(text: &str) -> (HashSet<String>, Vec<String>, Vec<String>) {
         }
     }
     (ids, labels, unknown)
+}
+
+fn fuel_mask(ids: &HashSet<String>) -> FuelMask {
+    FUEL_NAMES.iter().enumerate().fold(0, |mask, (i, (id, _))| {
+        mask | (FuelMask::from(ids.contains(*id)) << i)
+    })
+}
+
+/// Keep unrelated tokens byte for byte. When dropping a token that covers several IDs, add
+/// back just the surviving IDs that aren't already covered by another token.
+pub(crate) fn edit_fuel_exclusions(text: &str, edits: FuelEdits) -> Option<String> {
+    let tokens: Vec<_> = text.split(',').map(|token| {
+        (token, fuel_mask(&match_fuel_token(token).1))
+    }).collect();
+    let current = tokens.iter().fold(0, |mask, &(_, ids)| mask | ids);
+    let desired = edits.apply(current);
+    if desired == current {
+        return None;
+    }
+    let mut covered = 0;
+    let kept: Vec<_> = tokens.into_iter().filter_map(|(token, ids)| {
+        if ids & !desired != 0 {
+            return None;
+        }
+        covered |= ids;
+        Some(token)
+    }).collect();
+    let mut edited = kept.join(",");
+    for (index, &(id, _)) in FUEL_NAMES.iter().enumerate() {
+        if (desired & !covered) & (1 << index) != 0 && !LEGACY_FUEL_IDS.contains(&id) {
+            if edited.trim().is_empty() {
+                edited.clear();
+            } else {
+                edited.push_str(", ");
+            }
+            edited.push_str(id);
+        }
+    }
+    Some(edited)
+}
+
+fn never_spend_text(settings: &Settings) -> &str {
+    settings.get("never_spend").and_then(Value::as_str).unwrap_or_default()
+}
+
+pub(crate) fn fuel_exclusion_mask(text: &str) -> FuelMask {
+    fuel_mask(&parse_never(text).0)
 }
 
 struct NameFns {
@@ -431,7 +538,9 @@ impl QuickRecharge {
             namer_live: AtomicBool::new(false),
             lang: crate::common::lang::detect(&ctx.image, &log),
         });
-        runtime.refresh_never(true);
+        if let Ok(settings) = settings.lock() {
+            runtime.refresh_never(never_spend_text(&settings));
+        }
         let _ = RUNTIME.set(runtime.clone());
 
         let game_result = Game::new(&ctx.image, &log);
@@ -479,14 +588,8 @@ impl QuickRuntime {
         parts.join("; ")
     }
 
-    fn refresh_never(&self, log_change: bool) {
-        let text = self
-            .settings
-            .lock()
-            .ok()
-            .and_then(|s| s.get("never_spend").and_then(|v| v.as_str()).map(str::to_string))
-            .unwrap_or_default();
-        let report = self.never_report(&text);
+    fn refresh_never(&self, text: &str) {
+        let report = self.never_report(text);
         let key: HashSet<String> = self
             .skip_ids
             .lock()
@@ -494,16 +597,19 @@ impl QuickRuntime {
             .map(|g| g.clone())
             .unwrap_or_default();
         let prev = self.skip_key.lock().ok().and_then(|k| k.clone());
-        if log_change {
-            let changed = prev.as_ref() != Some(&key);
-            if changed && (prev.is_some() || !key.is_empty()) {
-                self.log
-                    .info(&format!("Never spend {}", if report.is_empty() { "off".into() } else { report }));
-            }
+        if prev.as_ref() != Some(&key) && (prev.is_some() || !key.is_empty()) {
+            self.log
+                .info(&format!("Never spend {}", if report.is_empty() { "off".into() } else { report }));
         }
         if let Ok(mut sk) = self.skip_key.lock() {
             *sk = Some(key);
         }
+    }
+
+    fn save_never_spend(&self, settings: &mut Settings, text: &str) -> Result<(), String> {
+        settings.set("never_spend", json!(text))?;
+        self.refresh_never(text);
+        Ok(())
     }
 
     fn after_trigger(&self, menu: u64, entry: u64, commit: u8) {
@@ -1128,13 +1234,12 @@ fn spend_all(rt: &QuickRuntime, game: &Game, owner: usize, listed: &[usize]) -> 
     ));
     let skip_nonempty = rt.skip_ids.lock().ok().map(|s| !s.is_empty()).unwrap_or(false);
     if skip_nonempty {
-        let text = rt
+        let report = rt
             .settings
             .lock()
             .ok()
-            .and_then(|s| s.get("never_spend").and_then(|v| v.as_str()).map(str::to_string))
+            .map(|settings| rt.never_report(never_spend_text(&settings)))
             .unwrap_or_default();
-        let report = rt.never_report(&text);
         let fallback = rt
             .skip_ids
             .lock()
@@ -1484,13 +1589,9 @@ impl GameMod for QuickRecharge {
             }
             "never_spend" => {
                 let text = value.as_str().ok_or_else(|| "expected string".to_string())?;
-                self.settings
-                    .lock()
-                    .map_err(|_| "settings lock poisoned")?
-                    .set(key, json!(text))?;
-                if let Some(rt) = RUNTIME.get() {
-                    rt.refresh_never(true);
-                }
+                let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+                let runtime = RUNTIME.get().ok_or("Quick Recharge is unavailable")?;
+                runtime.save_never_spend(&mut settings, text)?;
                 Ok("Never spend updated".to_string())
             }
             "play_sound" | "show_notice" => {
@@ -1519,6 +1620,161 @@ impl GameMod for QuickRecharge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn group(id: &str) -> FuelMask {
+        fuel_groups().into_iter().find(|group| group.id == id).unwrap().mask
+    }
+
+    #[test]
+    fn groups_cover_selectable_ids_without_overlaps() {
+        let groups = fuel_groups();
+        assert_eq!(groups.len(), 24);
+        let mut covered = 0;
+        for fuel in groups {
+            assert_eq!(covered & fuel.mask, 0);
+            covered |= fuel.mask;
+        }
+        let legacy_plants = fuel_exclusion_mask(&PLANTS_WITHOUT_RECHARGE_TARGETS.join(","));
+        assert_eq!(legacy_plants.count_ones(), 4);
+        assert_eq!(covered.count_ones(), 28);
+        assert_eq!(covered & legacy_plants, 0);
+        assert_eq!(covered | legacy_plants, ALL_FUELS);
+    }
+
+    #[test]
+    fn toggling_a_fuel_preserves_unrelated_tokens() {
+        let text = "Sodium, fUeL1, unknownzz,  ion batery , caRbOn";
+        let live = fuel_mask(&parse_never(text).0);
+        let sodium = group("SODIUM");
+        assert_eq!(live & sodium, sodium);
+        let mut edits = FuelEdits::default();
+        edits.set_group(group("FUEL1"), false, live);
+        let removed = edit_fuel_exclusions(text, edits).unwrap();
+        assert_eq!(removed, "Sodium, unknownzz,  ion batery ");
+        assert_eq!(fuel_mask(&parse_never(&removed).0) & sodium, live & sodium);
+
+        edits.set_group(group("FUEL1"), true, live);
+        assert!(edits.is_empty());
+        assert_eq!(edit_fuel_exclusions(text, edits), None);
+
+        edits.set_group(sodium, true, live);
+        assert_eq!(edit_fuel_exclusions(text, edits), None);
+        let reset = edit_fuel_exclusions(text, FuelEdits::reset()).unwrap();
+        assert_eq!(reset.trim(), "unknownzz");
+    }
+
+    #[test]
+    fn selector_edits_the_shared_manual_draft() {
+        let sodium = group("SODIUM");
+        let typed = "Sodium, CATALYST1, Phosphorus,  unknownzz ";
+        let mask = fuel_exclusion_mask(typed);
+        assert_eq!(mask & sodium, sodium);
+        let mut edits = FuelEdits::default();
+        edits.set_group(sodium, false, mask);
+        let draft = edit_fuel_exclusions(typed, edits).unwrap();
+        assert_eq!(draft, " Phosphorus,  unknownzz ");
+        assert_eq!(parse_never(&draft).0, HashSet::from(["HOT1".to_owned()]));
+        assert_eq!(fuel_exclusion_mask(&draft) & sodium, 0);
+    }
+
+    #[test]
+    fn the_full_selector_round_trips_through_the_parser() {
+        let mut edits = FuelEdits::default();
+        for fuel in fuel_groups() {
+            edits.set_group(fuel.mask, true, 0);
+        }
+        let text = edit_fuel_exclusions("unknownzz", edits).unwrap();
+        let (ids, _, unknown) = parse_never(&text);
+        let legacy_plants = fuel_exclusion_mask(&PLANTS_WITHOUT_RECHARGE_TARGETS.join(","));
+        assert_eq!(fuel_mask(&ids), ALL_FUELS & !legacy_plants);
+        assert_eq!(unknown, ["unknownzz"]);
+        assert_eq!(edit_fuel_exclusions(&text, edits), None);
+        assert_eq!(edit_fuel_exclusions(&text, FuelEdits::reset()).as_deref(), Some("unknownzz"));
+    }
+
+    #[test]
+    fn selector_changes_preserve_existing_plant_exclusions() {
+        let plants = "Solanium, PLANT_SNOW, Fungal Mould, Gamma Root";
+        let mask = fuel_exclusion_mask(plants);
+        assert_eq!(mask.count_ones(), 4);
+        let mut edits = FuelEdits::default();
+        edits.set_group(group("FUEL1"), true, mask);
+        let draft = edit_fuel_exclusions(plants, edits).unwrap();
+        assert_eq!(draft, format!("{plants}, FUEL1"));
+        assert_eq!(fuel_exclusion_mask(&draft), mask | group("FUEL1"));
+    }
+
+    #[test]
+    fn fuel_aliases_match_the_same_exclusion_and_new_edits_write_one_id() {
+        for (name, legacy, current) in [
+            ("Sodium", "SODIUM", "CATALYST1"),
+            ("Sodium Nitrate", "SODIUM2", "CATALYST2"),
+            ("Ion Battery", "CHARGECELL", "POWERCELL"),
+            ("Pyrite", "DUST1", "DUSTY1"),
+        ] {
+            let expected_ids = HashSet::from([legacy.to_owned(), current.to_owned()]);
+            let fuel = group(legacy);
+            for token in [name, legacy, current] {
+                let (ids, labels, unknown) = parse_never(token);
+                assert_eq!(ids, expected_ids, "{token}");
+                assert_eq!(labels, [name]);
+                assert!(unknown.is_empty());
+                assert_eq!(fuel_exclusion_mask(token), fuel);
+            }
+            let mut edits = FuelEdits::default();
+            edits.set_group(fuel, true, 0);
+            assert_eq!(edit_fuel_exclusions("", edits).as_deref(), Some(current));
+        }
+    }
+
+    #[test]
+    fn selector_apply_shares_the_manual_setting_and_persists_through_reload() {
+        let dir = std::env::temp_dir().join(format!("nms-quick-recharge-fuels-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("quick_recharge.json");
+        let defaults = json!({"never_spend": "", "free_fill": false});
+        let runtime = QuickRuntime {
+            log: Arc::new(Log::open(&dir.join("test.log"), false)),
+            status: Arc::new(Mutex::new(String::new())),
+            settings: Arc::new(Mutex::new(Settings::load(&path, defaults.clone()))),
+            game: Mutex::new(None),
+            skip_ids: Mutex::new(HashSet::new()),
+            skip_key: Mutex::new(None),
+            table_logged: Mutex::new(HashSet::new()),
+            namer_live: AtomicBool::new(false),
+            lang: "en",
+        };
+        let saved_text = "Uranium, Sodium, unknownzz";
+        {
+            let mut settings = runtime.settings.lock().unwrap();
+            settings.set("free_fill", json!(true)).unwrap();
+            runtime.save_never_spend(&mut settings, saved_text).unwrap();
+        }
+        assert!(runtime.skip_ids.lock().unwrap().contains("CATALYST1"));
+        let mut edits = FuelEdits::default();
+        edits.set_group(group("FUEL1"), true, 0);
+        edits.set_group(group("CHARGECELL"), true, 0);
+        let expected = "Uranium, Sodium, unknownzz, FUEL1, POWERCELL";
+        let draft = edit_fuel_exclusions(saved_text, edits).unwrap();
+        assert_eq!(draft, expected);
+        assert!(!runtime.skip_ids.lock().unwrap().contains("FUEL1"));
+        assert_eq!(never_spend_text(&Settings::load(&path, defaults.clone())), saved_text);
+        runtime.save_never_spend(&mut runtime.settings.lock().unwrap(), &draft).unwrap();
+        assert!(runtime.skip_ids.lock().unwrap().contains("FUEL1"));
+        let reloaded = Settings::load(&path, defaults.clone());
+        assert_eq!(never_spend_text(&reloaded), expected);
+        assert!(reloaded.is_true("free_fill"));
+        runtime.refresh_never(never_spend_text(&reloaded));
+        assert!(runtime.skip_ids.lock().unwrap().contains("POWERCELL"));
+        runtime.save_never_spend(&mut runtime.settings.lock().unwrap(), "").unwrap();
+        let reloaded = Settings::load(&path, defaults);
+        assert_eq!(never_spend_text(&reloaded), "");
+        assert!(reloaded.is_true("free_fill"));
+        assert!(runtime.skip_ids.lock().unwrap().is_empty());
+        drop(runtime);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn notice_follows_the_language_and_keeps_utf8() {

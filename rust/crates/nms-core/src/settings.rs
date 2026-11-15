@@ -61,8 +61,16 @@ impl Settings {
         if !self.defaults.contains_key(key) {
             return Err(format!("unknown setting {key:?}"));
         }
-        self.values.insert(key.to_string(), value);
-        self.save()
+        let previous = self.values.insert(key.to_string(), value);
+        if let Err(err) = self.save() {
+            if let Some(previous) = previous {
+                self.values.insert(key.to_string(), previous);
+            } else {
+                self.values.remove(key);
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -135,5 +143,17 @@ mod tests {
         assert!(s.set("b", json!(true)).is_err());
         assert!(s.set("a", json!(false)).is_ok());
         assert!(!s.is_true("a"));
+    }
+
+    #[test]
+    fn failed_save_keeps_the_previous_value_in_memory() {
+        let path = temp("save-fail");
+        let mut settings = Settings::load(&path, json!({"a": true}));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(settings.set("a", json!(false)).is_err());
+        assert!(settings.is_true("a"));
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
     }
 }

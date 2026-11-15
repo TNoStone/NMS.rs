@@ -147,6 +147,30 @@ fn parse_modes(text: &str) -> Result<u32, String> {
     }
 }
 
+/// The extra primary modes documented for More modes. The text editor also supports
+/// the remaining game mode IDs, including ones from existing settings.
+const SELECTABLE_MODES: &[&str] = &[
+    "Shotgun", "Burst", "Rail", "Cannon", "SunLaser", "Spawner", "SoulLaser",
+    "Flamethrower", "FishLaser", "Gravity",
+];
+
+pub(crate) fn selectable_modes() -> impl Iterator<Item = (&'static str, u64)> {
+    MODE_NAMES.iter().copied().enumerate()
+        .filter(|(_, name)| SELECTABLE_MODES.contains(name))
+        .map(|(index, name)| (name, 1 << index))
+}
+
+pub(crate) fn more_modes_mask(text: &str) -> Option<u64> {
+    parse_modes(text).ok().map(u64::from)
+}
+
+pub(crate) fn more_modes_text(mask: u64) -> String {
+    MODE_NAMES.iter().copied().enumerate()
+        .filter_map(|(index, name)| (mask & (1 << index) != 0).then_some(name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The modes the submenu gets on top of the vanilla secondaries.
 fn extra_mask(laser: bool, bolt: bool, terrain: bool, more: u32) -> u32 {
     let mut m = more;
@@ -630,6 +654,18 @@ mod tests {
         assert_eq!(extra_mask(false, false, false, u32::MAX), (1 << 21) - 1);
         // The three defaults are primaries in the live mask.
         assert_eq!(LIVE_MASK & 0x821, 0);
+    }
+
+    #[test]
+    fn picker_round_trips_visible_and_manual_modes() {
+        let entries: Vec<_> = selectable_modes().collect();
+        assert_eq!(entries.len(), SELECTABLE_MODES.len());
+        assert!(entries.iter().all(|(name, mask)| more_modes_mask(name) == Some(*mask)));
+        let saved = more_modes_mask("1; SpawnerAlt, Bolt").unwrap();
+        let edited = (saved | more_modes_mask("Rail").unwrap()) & !more_modes_mask("Shotgun").unwrap();
+        assert_eq!(more_modes_text(edited), "Bolt, Rail, SpawnerAlt");
+        assert_eq!(more_modes_mask(&more_modes_text(edited)), Some(edited));
+        assert_eq!(more_modes_mask("Rail, bogus"), None);
     }
 
     #[test]

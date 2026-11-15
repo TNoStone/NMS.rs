@@ -83,6 +83,30 @@ pub const STACK_COUNT: &str = "83 3D ? ? ? ? ? 0F 84 ? ? ? ? 48 89 9C 24 ? ? ? ?
 /// `mov rax, [rip+disp32]`: the page stack data pointer. Displacement at byte 3, instruction 7 long.
 pub const STACK_DATA: &str = "48 8B 05 ? ? ? ? FF C9 48 8B 9D";
 
+/// Native Options drawing loads the top stack entry and branches past the vanilla page table for
+/// IDs above 7. The branch target still passes the common page to EndPage.
+pub const OPTIONS_PAGE_DISPATCH: &str = "8B 0D ? ? ? ? 4C 8D 3D ? ? ? ? 48 8B 05 ? ? ? ? FF C9 48 8B 9D 30 27 00 00 48 8B B5 38 27 00 00 48 8B 0C C8 48 63 01 83 F8 07 0F 87 ? ? ? ?";
+/// RequestOptionsPage allocates a four-byte page ID, then pushes it onto the native stack.
+pub const OPTIONS_PAGE_PUSH: &str = "B9 04 00 00 00 E8 ? ? ? ? 33 F6 48 8B C8 48 85 C0 74 04 89 18 EB 03 48 8B CE 8B 05 ? ? ? ? BF 01 00 00 00 3B 05 ? ? ? ? 48 8B 15 ? ? ? ? 48 89 8C 24 20 01 00 00 73 0C 48 89 0C C2 FF 05 ? ? ? ?";
+/// OptionsBack decrements the stack count and returns to the remaining page.
+pub const OPTIONS_PAGE_POP: &str = "8B 05 ? ? ? ? 83 F8 01 76 ? 85 C0 74 ? FF C8 89 05 ? ? ? ? 85 C0 74 ?";
+
+/// After EndPage, the Options renderer passes the scroll content from RSI to the scroll routine.
+/// Verify this call reaches the scroll routine and restrict the hook to this caller.
+pub const OPTIONS_SCROLL_CALL_AT: usize = 0x1D;
+pub const OPTIONS_SCROLL_CALL: &str =
+    "48 8B D6 44 88 4C 24 30 48 8B CB C6 44 24 28 00 F3 0F 11 44 24 20 C6 85 70 27 00 00 00 E8 ? ? ? ? 48 85 FF";
+/// Entry of the Options scroll routine, including the eighth argument load and viewport registers.
+pub const OPTIONS_SCROLL_UPDATE: &str =
+    "48 8B C4 48 89 58 20 55 56 57 41 54 41 55 48 81 EC E0 00 00 00 66 0F 6F 0D ? ? ? ? 48 8B F9 4C 8B A4 24 48 01 00 00 48 8B DA 0F 29 70 C8";
+/// The scroll routine clamps the content transform's Y offset against its extent and zero.
+pub const OPTIONS_SCROLL_CLAMP: &str =
+    "48 8B 43 48 4C 8D 05 ? ? ? ? 44 0F 28 C7 33 C9 F3 45 0F 5C C1 41 0F 28 C0 F3 0F 5F 40 30 F3 0F 5D F0 0F 57 C0 0F 11 44 24 30 F3 0F 11 70 30 48 8B 43 48 F3 44 0F 10 50 30";
+
+/// The scroll routine measures the viewport element's height before calculating its range.
+pub const OPTIONS_VIEWPORT_HEIGHT: &str =
+    "40 53 48 83 EC 30 48 8B 41 48 85 D2 0F 29 74 24 20 0F B6 58 3E F3 0F 10 70 24 B8 01 00 00 00 0F 45 C2 83 F8 01 75 ?";
+
 pub const TABLE: ModSigs = ModSigs {
     owner: "InGameMenu",
     sigs: &[
@@ -109,6 +133,13 @@ pub const TABLE: ModSigs = ModSigs {
         Sig { name: "REQUEST_OPTIONS_PAGE", pattern: REQUEST_OPTIONS_PAGE, kind: SigUse::Locate },
         Sig { name: "STACK_COUNT", pattern: STACK_COUNT, kind: SigUse::Locate },
         Sig { name: "STACK_DATA", pattern: STACK_DATA, kind: SigUse::Locate },
+        Sig { name: "OPTIONS_PAGE_DISPATCH", pattern: OPTIONS_PAGE_DISPATCH, kind: SigUse::Locate },
+        Sig { name: "OPTIONS_PAGE_PUSH", pattern: OPTIONS_PAGE_PUSH, kind: SigUse::Locate },
+        Sig { name: "OPTIONS_PAGE_POP", pattern: OPTIONS_PAGE_POP, kind: SigUse::Locate },
+        Sig { name: "OPTIONS_SCROLL_CALL", pattern: OPTIONS_SCROLL_CALL, kind: SigUse::Locate },
+        Sig { name: "OPTIONS_SCROLL_UPDATE", pattern: OPTIONS_SCROLL_UPDATE, kind: SigUse::Hook },
+        Sig { name: "OPTIONS_SCROLL_CLAMP", pattern: OPTIONS_SCROLL_CLAMP, kind: SigUse::Locate },
+        Sig { name: "OPTIONS_VIEWPORT_HEIGHT", pattern: OPTIONS_VIEWPORT_HEIGHT, kind: SigUse::Locate },
     ],
     patches: &[] as &[CodePatch],
 };

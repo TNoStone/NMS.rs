@@ -88,6 +88,10 @@ pub fn choice(lang: &str, mod_name: &str, key: &str, choice_key: &str) -> Option
     find(lang, &format!("choice.{mod_name}.{key}.{choice_key}"))
 }
 
+pub fn list_separator(lang: &str) -> &'static str {
+    if matches!(lang, "ja" | "zh" | "zh-Hant") { "、" } else { ", " }
+}
+
 /// Replaces `{n}` and `{name}` in `text`.
 pub fn fill(text: &str, n: usize, name: &str) -> String {
     text.replace("{n}", &n.to_string()).replace("{name}", name)
@@ -133,6 +137,17 @@ mod tests {
             assert!(!v.is_empty(), "{code}");
         }
         assert_eq!(FILES.len(), 15);
+    }
+
+    #[test]
+    fn every_language_names_every_never_spend_row() {
+        let groups = crate::quick_recharge::fuel_groups();
+        for (lang, _) in FILES {
+            for fuel in &groups {
+                let key = format!("choice.QuickRecharge.never_spend.{}", fuel.id);
+                assert!(table(lang).contains_key(key.as_str()), "{lang} {key}");
+            }
+        }
     }
 
     #[test]

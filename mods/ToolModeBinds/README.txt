@@ -40,9 +40,11 @@ Switches (in-game Mods page, ToolModeBinds)
   after you remove or uninstall the mod: the bind is saved by the game, and
   pressing that key then only plays the click.
 - Mining Laser, Boltcaster, Terrain Manipulator (on). Which rows to add.
-- More modes (empty). Other main modes to add, by game name, separated by
-  commas: Shotgun, Burst, Rail, Cannon, SunLaser, Spawner, SoulLaser,
-  Flamethrower, FishLaser, Gravity. Untested.
+- More modes (empty). Open Select modes and toggle the extra weapon modes
+  you want to add. Use Back and then Apply on Mods to save. The picker works
+  from the title screen. In game, Edit modes as text also accepts mode names
+  or numbers, including modes outside the picker. These extra modes are
+  experimental.
 - Write log (off): writes each row let into the list and each mode switch
   to tool_mode_binds.log.
 

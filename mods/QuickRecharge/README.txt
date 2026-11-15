@@ -19,10 +19,17 @@ Switches (in-game Mods page, QuickRecharge)
   class it still uses strongest that fits, then cheapest to top off. Off:
   strongest fuel first, mixed. If no substance can charge that tech, it
   still uses the product. Applies live.
-- Never spend (empty): comma-separated fuel names this charge-all will not
-  take, for example "ion batery, launch fuel". Typos and short names are
-  matched to the real item (Ion Battery, Starship Launch Fuel). Empty: no
-  extra skip. Applies live.
+- Never spend (all off by default): choose Select fuels and turn on the
+  fuels you want Charge menu: all to leave alone. The picker also works
+  from the title screen. Hover over Select fuels to review your exclusions.
+  Go Back to Mods and choose Apply to save. Undo Changes or Back > Discard
+  drops the draft. Mods > Reset to Default stages the shipped settings.
+- In gameplay, Edit exclusions as text edits the same comma-separated list.
+  It accepts names and IDs. Either accepted ID or the display name excludes
+  the same fuel for Sodium, Sodium Nitrate, Ion Battery and Pyrite. The text
+  box can reopen values of up to 63 UTF-8 bytes. For longer lists, use the
+  selector or the NMS.rs set command. The Clear buttons stage an empty list.
+  The original text row remains available if only the text box is supported.
 - Free fill (no cost) (off): fills every listed tech for nothing, like the
   free-charge game setting. Only used when this is on.
 - Play charge sound (on): the game's own charge sound, once per recharge-all.

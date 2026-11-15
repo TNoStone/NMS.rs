@@ -4,7 +4,7 @@
 //! The game draws Options rows in code
 //! every frame with a small widget library, so we add rows by calling those widgets ourselves:
 //! - `FinalizePage` (before): on the Options list (page 6) add a `Mods` button under View Credits.
-//! - `EndPage` (before): on our page (id 8) draw the rows, then finalize the page as the game does.
+//! - `EndPage` (before): draw Mods or one of its two selection pages and finalize it.
 //!
 //! - `DoGameSwitcher` (after): the pause-menu list. Its rows are MBIN elements; ours is `BUTTON_MODS`,
 //!   added to `SWITCHERPAGENEW` by `NMSrsMenu.lua`. We find it by name with the game's own lookup and
@@ -24,10 +24,11 @@
 //! every read is checked.
 
 use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use nms_core::log::Log;
+use nms_core::{detour, log::Log};
 use nms_core::mem::{read_ptr, read_u32, read_u8, MIN_ADDR};
 use super::input::async_key_down;
 use super::{lang, menu_text};
@@ -37,11 +38,58 @@ use nms_core::{Code, Kind, Pattern, Range, Registry};
 use nms_sdk::sigs::ingame_options as sigs;
 use serde_json::json;
 
+use crate::{quick_recharge, tool_mode_binds};
+use crate::quick_recharge::FuelEdits;
 use super::hooks::{options_end_page, options_finalize_page, options_game_switcher, options_page_title, text_input_update};
 
 /// `eOptionsMenu` values the game defines are 0..=7; 6 is the Options list. 8 is ours.
 const LIST_PAGE: u32 = 6;
 const MODS_PAGE: u32 = 8;
+const NEVER_SPEND_PAGE: u32 = 9;
+const MORE_MODES_PAGE: u32 = 10;
+const QUICK_RECHARGE: &str = "QuickRecharge";
+const NEVER_SPEND: &str = "never_spend";
+const TOOL_MODE_BINDS: &str = "ToolModeBinds";
+const MORE_MODES: &str = "more_modes";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildPage {
+    NeverSpend,
+    MoreModes,
+}
+
+impl ChildPage {
+    fn id(self) -> u32 {
+        match self {
+            Self::NeverSpend => NEVER_SPEND_PAGE,
+            Self::MoreModes => MORE_MODES_PAGE,
+        }
+    }
+
+    fn from_id(id: u32) -> Option<Self> {
+        match id {
+            NEVER_SPEND_PAGE => Some(Self::NeverSpend),
+            MORE_MODES_PAGE => Some(Self::MoreModes),
+            _ => None,
+        }
+    }
+
+    fn from_setting(mod_name: &str, key: &str) -> Option<Self> {
+        match (mod_name, key) {
+            (QUICK_RECHARGE, NEVER_SPEND) => Some(Self::NeverSpend),
+            (TOOL_MODE_BINDS, MORE_MODES) => Some(Self::MoreModes),
+            _ => None,
+        }
+    }
+
+    fn setting(self) -> (&'static str, &'static str) {
+        match self {
+            Self::NeverSpend => (QUICK_RECHARGE, NEVER_SPEND),
+            Self::MoreModes => (TOOL_MODE_BINDS, MORE_MODES),
+        }
+    }
+}
+
 /// Addresses below this are not elements.
 const MIN_ELEMENT: usize = MIN_ADDR;
 /// `cGcOptionsUIHeaderIcons::Advanced`.
@@ -93,6 +141,17 @@ struct Section {
 unsafe impl Send for Section {}
 unsafe impl Sync for Section {}
 
+struct PickerRow {
+    name: &'static str,
+    label: *const u8,
+    desc: *const u8,
+    mask: u64,
+}
+
+// SAFETY: the label and description point to leaked, never-freed byte strings.
+unsafe impl Send for PickerRow {}
+unsafe impl Sync for PickerRow {}
+
 /// The page's own strings in one language, as leaked C strings.
 struct Ui {
     mods: *const u8,
@@ -100,6 +159,7 @@ struct Ui {
     clear: *const u8,
     clear_desc: *const u8,
     no_edit: *const u8,
+    text_too_long: *const u8,
     /// Hint shown in a text row whose value is empty (a plain string: it is part of the cell text).
     not_set: String,
     /// Main menu, where text cannot be typed: the empty-value hint and the greyed-out Clear row.
@@ -117,6 +177,85 @@ struct Built {
     lang: &'static str,
     ui: Ui,
     sections: Vec<Section>,
+    fuels: Picker,
+    modes: Picker,
+}
+
+impl Built {
+    fn picker(&self, page: ChildPage) -> &Picker {
+        match page {
+            ChildPage::NeverSpend => &self.fuels,
+            ChildPage::MoreModes => &self.modes,
+        }
+    }
+}
+
+struct Picker {
+    title: *const u8,
+    help: *const u8,
+    action: *const u8,
+    header: *const u8,
+    clear: *const u8,
+    clear_text: *const u8,
+    clear_help: *const u8,
+    summary_key: &'static str,
+    empty_key: &'static str,
+    rows: Vec<PickerRow>,
+    selection: Mutex<PickerSelection>,
+}
+
+// SAFETY: the pointers refer to leaked, never-freed byte strings.
+unsafe impl Send for Picker {}
+unsafe impl Sync for Picker {}
+
+#[derive(Default)]
+struct PickerSelection {
+    text: Option<String>,
+    mask: Option<u64>,
+    // Native rows may keep a tooltip pointer. Intern each distinct summary for this language.
+    tooltips: HashMap<u64, &'static CStr>,
+}
+
+impl PickerSelection {
+    fn mask(&mut self, page: ChildPage, text: &str) -> Option<u64> {
+        if self.text.as_deref() != Some(text) {
+            self.mask = match page {
+                ChildPage::NeverSpend => Some(quick_recharge::fuel_exclusion_mask(text)),
+                ChildPage::MoreModes => tool_mode_binds::more_modes_mask(text),
+            };
+            self.text = Some(text.to_owned());
+        }
+        self.mask
+    }
+
+    fn tooltip(&mut self, page: ChildPage, picker: &Picker, lang: &str, text: &str) -> *const u8 {
+        let Some(mask) = self.mask(page, text) else { return picker.help };
+        if let Some(tooltip) = self.tooltips.get(&mask) {
+            return tooltip.as_ptr().cast();
+        }
+        let summary = selected_summary(lang, &picker.rows, mask, picker.summary_key, picker.empty_key);
+        let Ok(tooltip) = CString::new(summary) else { return picker.help };
+        let tooltip = Box::leak(tooltip.into_boxed_c_str());
+        self.tooltips.insert(mask, tooltip);
+        tooltip.as_ptr().cast()
+    }
+}
+
+fn selected_summary(lang: &str, rows: &[PickerRow], mask: u64, summary_key: &str, empty_key: &str) -> String {
+    let mut selected = Vec::new();
+    for row in rows {
+        if mask & row.mask != 0 {
+            selected.push(row.name);
+        }
+    }
+    if selected.is_empty() {
+        return menu_text::ui(lang, empty_key).to_owned();
+    }
+    menu_text::fill(
+        menu_text::ui(lang, summary_key),
+        0,
+        &selected.join(menu_text::list_separator(lang)),
+    )
 }
 
 /// The empty suffix text for number rows.
@@ -129,6 +268,58 @@ static IMAGE: OnceLock<ProcessImage> = OnceLock::new();
 static LANG_CHECKED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Changes the player made on the page and has not applied: `(mod, key)` to the value.
 static STAGED: Mutex<Option<HashMap<(&'static str, &'static str), serde_json::Value>>> = Mutex::new(None);
+/// Only the native stack entry we requested can draw the selector. Drafts live on the Mods page.
+enum ChildPageState {
+    Closed,
+    Requested(ChildPage),
+    Open(ChildPage),
+}
+
+struct ChildNavigation {
+    page: ChildPageState,
+    parent_scroll: Option<f32>,
+    return_scroll: Option<ScrollRestore>,
+}
+
+impl ChildNavigation {
+    const NEW: Self = Self { page: ChildPageState::Closed, parent_scroll: None, return_scroll: None };
+
+    fn close(&mut self, top: Option<u32>) {
+        let previous = std::mem::replace(&mut self.page, ChildPageState::Closed);
+        if top != Some(MODS_PAGE) {
+            self.return_scroll = None;
+        } else if matches!(previous, ChildPageState::Open(_)) {
+            // The text popup can re-open the child after an accidental Back. Keep the
+            // original snapshot across that recovery, but restore only once per return.
+            self.return_scroll = self.parent_scroll.filter(|&position| position < 0.0)
+                .map(|position| ScrollRestore { position, passes_left: SCROLL_RESTORE_PASSES });
+        }
+    }
+
+    fn finish_scroll_pass(&mut self, result: Option<f32>) -> Option<ScrollRestore> {
+        let pending = self.return_scroll.as_mut()?;
+        pending.passes_left -= 1;
+        if result.is_some_and(|position| position < 0.0) || pending.passes_left == 0 {
+            self.return_scroll.take()
+        } else {
+            None
+        }
+    }
+}
+
+// The layout can report a zero scroll range while the parent page is being rebuilt.
+const SCROLL_RESTORE_PASSES: u8 = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScrollRestore {
+    position: f32,
+    passes_left: u8,
+}
+
+static CHILD_PAGES_VALIDATED: AtomicBool = AtomicBool::new(false);
+static OPTIONS_SCROLL_CALLER: AtomicUsize = AtomicUsize::new(0);
+static OPTIONS_VIEWPORT_HEIGHT: AtomicUsize = AtomicUsize::new(0);
+static CHILD_NAVIGATION: Mutex<ChildNavigation> = Mutex::new(ChildNavigation::NEW);
 /// A click on a text row, held until the end of the frame: when Reset is confirmed the game gives
 /// every row its default, which a row drawn as "off" reports as a click, so the click only counts
 /// if the same frame (and the next moments) did not also report Reset.
@@ -170,6 +361,7 @@ static OPENED_IN_GAME: AtomicBool = AtomicBool::new(false);
 /// When the finished result was first seen (ms); 0 when none. Finishing waits `FINISH_DELAY_MS` after that.
 static DONE_SEEN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// After a popup closes, if the page is left before this time (ms), it was the closing press that did it.
+static WATCH_PAGE: AtomicU32 = AtomicU32::new(MODS_PAGE);
 static WATCH_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// When our popup was started, on the `now_ms` clock.
 static STARTED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -178,7 +370,13 @@ static TEXT_MGR: AtomicUsize = AtomicUsize::new(0);
 /// Text rows are drawn only when every text-input routine was found and `Update` is hooked.
 static TEXT_READY: AtomicBool = AtomicBool::new(false);
 /// The setting the open popup will write: `(mod, key)`. `None` when no popup of ours is open.
-static PENDING: Mutex<Option<(&'static str, &'static str)>> = Mutex::new(None);
+struct TextEdit {
+    page: u32,
+    mod_name: &'static str,
+    key: &'static str,
+}
+
+static PENDING: Mutex<Option<TextEdit>> = Mutex::new(None);
 static BACK_ORIG: AtomicUsize = AtomicUsize::new(0);
 static BACK_HOOK: OnceLock<nms_core::hook::Hook> = OnceLock::new();
 /// How long a text box may block Back, at most (ms). Back can never stay blocked for longer.
@@ -294,7 +492,7 @@ fn rip_target(image: &ProcessImage, rva: usize, disp_at: usize, len: usize) -> O
     Some((image.va(rva + len) as i64 + disp as i64) as usize)
 }
 
-fn find(image: &ProcessImage, name: &str, pattern: &str) -> Result<usize, String> {
+fn find(image: &dyn Code, name: &str, pattern: &str) -> Result<usize, String> {
     let pat = Pattern::parse(pattern).map_err(|e| format!("{name}: {e}"))?;
     image.find_unique(&pat).unique().ok_or_else(|| format!("{name} not found (game update?)"))
 }
@@ -323,11 +521,27 @@ pub fn install(image: &ProcessImage, registry: Arc<Registry>, log: Arc<Log>) {
         Err(e) => log.info(&format!("in-game Mods menu: no text rows: {e}")),
     }
     let _ = IMAGE.set(image.clone());
+    let end = options_end_page::subscribe(image, sigs::END_PAGE, Some(on_end), Some(after_end));
+    let title = options_page_title::subscribe(image, sigs::PAGE_TITLE, None, Some(on_title));
+    let has_picker = registry.default_value(QUICK_RECHARGE, NEVER_SPEND).is_some()
+        || registry.default_value(TOOL_MODE_BINDS, MORE_MODES).is_some();
+    if end.is_ok() && title.is_ok() && has_picker {
+        match validate_child_navigation(image) {
+            Ok(()) => {
+                match install_options_scroll(image) {
+                    Ok(()) => log.info("Mods page: native scroll restoration available"),
+                    Err(e) => log.info(&format!("Mods page: scroll restoration unavailable: {e}")),
+                }
+                CHILD_PAGES_VALIDATED.store(true, Ordering::Release);
+                log.info("Mods page: nested selectors available");
+            }
+            Err(e) => log.info(&format!("Mods page: nested selectors unavailable: {e}")),
+        }
+    }
     refresh_language(true);
     let finalize = options_finalize_page::subscribe(image, sigs::FINALIZE_PAGE, Some(on_finalize), None);
-    let end = options_end_page::subscribe(image, sigs::END_PAGE, Some(on_end), None);
     // The title is cosmetic: without it our page keeps the default "OPTIONS" title.
-    if let Err(e) = options_page_title::subscribe(image, sigs::PAGE_TITLE, None, Some(on_title)) {
+    if let Err(e) = title {
         log.info(&format!("in-game Mods menu: page title not set: {e}"));
     }
     match locate_pause(image) {
@@ -494,15 +708,164 @@ fn locate_pause(image: &ProcessImage) -> Result<(), String> {
     Ok(())
 }
 
+/// Confirm the request, renderer and Back routine all use the same stack. On both checked builds
+/// IDs 8, 9, and 10 all bypass the vanilla jump table and enter EndPage with the same initialized page.
+fn validate_child_navigation(image: &dyn Code) -> Result<(), String> {
+    let count = find(image, "page stack count", sigs::STACK_COUNT)?;
+    let data = find(image, "page stack data", sigs::STACK_DATA)?;
+    let end = find(image, "EndPage", sigs::END_PAGE)?;
+    let request = find(image, "RequestOptionsPage", sigs::REQUEST_OPTIONS_PAGE)?;
+    let back = find(image, "OptionsBack", sigs::OPTIONS_BACK)?;
+    let dispatch = find(image, "options page dispatch", sigs::OPTIONS_PAGE_DISPATCH)?;
+    let push = find(image, "options page push", sigs::OPTIONS_PAGE_PUSH)?;
+    let pop = find(image, "options page pop", sigs::OPTIONS_PAGE_POP)?;
+    let rel = |rva: usize, offset: usize| rva.checked_add(offset).and_then(|at| image.rel32_target(at));
+    // The compare has an immediate byte after its displacement. RIP points past that byte.
+    let count_slot = rel(count, 2).and_then(|slot| slot.checked_add(1)).ok_or("page stack count unreadable")?;
+    let data_slot = rel(data, 3).ok_or("page stack data unreadable")?;
+
+    let default = rel(dispatch, 0x30).ok_or("default page dispatch unreadable")?;
+    if rel(dispatch, 2) != Some(count_slot)
+        || rel(dispatch, 0x10) != Some(data_slot)
+        || image.read(default, 6).as_deref() != Some(&[0x48, 0x8D, 0x4C, 0x24, 0x70, 0xE8])
+        || rel(default, 6) != Some(end)
+    {
+        return Err("custom page dispatch no longer reaches EndPage with the expected stack layout".into());
+    }
+    if push.checked_sub(request) != Some(0x43)
+        || rel(request, 0x60) != Some(count_slot)
+        || rel(request, 0x72) != Some(data_slot)
+        || rel(request, 0x86) != Some(count_slot)
+    {
+        return Err("RequestOptionsPage no longer pushes to the expected options stack".into());
+    }
+    // OptionsBack reads and frees the top entry before decrementing the same depth counter.
+    let back_reads_stack = back.checked_add(0x2C).and_then(|at| image.read(at, 0x17));
+    if pop.checked_sub(back) != Some(0x8C)
+        || !back_reads_stack.as_deref().is_some_and(|code| {
+            code.get(..2) == Some(&[0x8B, 0x05])
+                && code.get(0x0D..0x10) == Some(&[0x48, 0x8B, 0x05])
+                && code.get(0x14..0x17) == Some(&[0x48, 0x8B, 0x0C])
+        })
+        || rel(back, 0x2E) != Some(count_slot)
+        || rel(back, 0x3C) != Some(data_slot)
+        || rel(pop, 2) != Some(count_slot)
+        || rel(pop, 0x13) != Some(count_slot)
+    {
+        return Err("OptionsBack no longer pops from the expected options stack".into());
+    }
+    Ok(())
+}
+
+type ViewportHeightFn = unsafe extern "system" fn(u64, u32) -> f32;
+
+fn options_scroll_layout(image: &dyn Code) -> Result<(usize, usize, usize), String> {
+    let dispatch = find(image, "options page dispatch", sigs::OPTIONS_PAGE_DISPATCH)?;
+    let site = find(image, "options scroll call", sigs::OPTIONS_SCROLL_CALL)?;
+    let clamp = find(image, "options scroll clamp", sigs::OPTIONS_SCROLL_CLAMP)?;
+    let height = find(image, "options viewport height", sigs::OPTIONS_VIEWPORT_HEIGHT)?;
+    let block = image.rel32_target(dispatch + 0x30).ok_or("options page tail unreadable")?;
+    let call = site + sigs::OPTIONS_SCROLL_CALL_AT;
+    let scroll = find(image, "options scroll routine", sigs::OPTIONS_SCROLL_UPDATE)?;
+    // Validate the default drawing tail and the native height call. The callee uses stack
+    // argument five as a scroll fraction when nonnegative, then clamps the result.
+    if site.checked_sub(block) != Some(0x58)
+        || image.rel32_target(call + 1) != Some(scroll)
+        || clamp.checked_sub(scroll) != Some(0x7B1)
+        || image.read(scroll + 0x155, 5).as_deref() != Some(&[0xBA, 1, 0, 0, 0])
+        || image.read(scroll + 0x162, 4).as_deref() != Some(&[0x48, 0x8B, 0xCF, 0xE8])
+        || image.rel32_target(scroll + 0x166) != Some(height)
+        || image.read(scroll + 0x699, 11).as_deref() != Some(&[0xF3, 0x0F, 0x10, 0x94, 0x24, 0x30, 0x01, 0x00, 0x00, 0x0F, 0x2F])
+        || image.read(scroll + 0x6BE, 9).as_deref() != Some(&[0xF3, 0x41, 0x0F, 0x5C, 0xC1, 0xF3, 0x0F, 0x59, 0xC2])
+    {
+        return Err("options scroll layout changed (game update?)".into());
+    }
+    Ok((scroll, call + 5, height))
+}
+
+fn install_options_scroll(image: &ProcessImage) -> Result<(), String> {
+    let (scroll, caller, height) = options_scroll_layout(image)?;
+    // SAFETY: the validated call and callee take eight arguments. The shared detour
+    // preserves integer and XMM registers, including the position returned in XMM0.
+    unsafe {
+        detour::subscribe_at(
+            "OptionsScroll", image.va(scroll), 8, detour::Options::default(),
+            Some(before_options_scroll), Some(after_options_scroll),
+        )?;
+    }
+    OPTIONS_VIEWPORT_HEIGHT.store(image.va(height), Ordering::Release);
+    OPTIONS_SCROLL_CALLER.store(image.va(caller), Ordering::Release);
+    Ok(())
+}
+
+fn is_mods_scroll(call: &detour::Call) -> bool {
+    call.caller() == OPTIONS_SCROLL_CALLER.load(Ordering::Acquire) && top_state() == Some(MODS_PAGE)
+}
+
+fn scroll_fraction(position: f32, content_height: f32, viewport_height: f32) -> Option<f32> {
+    let overflow = content_height - viewport_height;
+    (viewport_height > 0.0 && overflow.is_finite() && overflow > 0.0)
+        .then(|| (-position / overflow).clamp(0.0, 1.0))
+}
+
+fn before_options_scroll(call: &mut detour::Call) -> detour::Flow {
+    if is_mods_scroll(call) {
+        let pending = CHILD_NAVIGATION.try_lock().ok().and_then(|state| state.return_scroll);
+        if let Some(pending) = pending {
+            let viewport = call.arg(0);
+            if (viewport as usize).checked_add(0x48).and_then(read_ptr).is_none() {
+                return detour::Flow::Continue;
+            }
+            // SAFETY: the renderer and updater both call this validated helper with the same
+            // viewport and mode 1. The game still writes the position and updates its scrollbar.
+            let height: ViewportHeightFn = unsafe { std::mem::transmute(OPTIONS_VIEWPORT_HEIGHT.load(Ordering::Acquire)) };
+            let viewport_height = unsafe { height(viewport, 1) };
+            if let Some(fraction) = scroll_fraction(pending.position, call.arg_f32(2), viewport_height) {
+                call.set_arg_f32(4, fraction);
+            }
+        }
+    }
+    detour::Flow::Continue
+}
+
+fn after_options_scroll(call: &mut detour::Call) {
+    if !is_mods_scroll(call) {
+        return;
+    }
+    let position = call.ret_f32();
+    let position = (position.is_finite() && position <= 0.0).then_some(position);
+    let restored = CHILD_NAVIGATION.try_lock().ok().and_then(|mut state| state.finish_scroll_pass(position));
+    if let Some(restored) = restored {
+        info(&format!("Mods page: scroll restore requested {:.1}, native result {position:?} after {} passes",
+            restored.position, SCROLL_RESTORE_PASSES - restored.passes_left));
+    }
+    // Open the child only after the native scroll update returns the parent's actual position.
+    open_requested_child(position);
+}
+
 /// The id of the Options page on top of the game's page stack.
 fn top_state() -> Option<u32> {
+    stack_state(0)
+}
+
+fn stack_state(depth_from_top: usize) -> Option<u32> {
     let count = read_u32(STACK_COUNT.load(Ordering::Acquire))? as usize;
-    if count == 0 || count > 32 {
+    if count > 32 {
         return None;
     }
+    let index = count.checked_sub(depth_from_top)?.checked_sub(1)?;
     let data = read_ptr(STACK_DATA.load(Ordering::Acquire))?;
-    let state = read_ptr(data + 8 * (count - 1))?;
+    let state = read_ptr(data.checked_add(8 * index)?)?;
     read_u32(state)
+}
+
+fn active_child(top: Option<u32>) -> Option<ChildPage> {
+    let page = ChildPage::from_id(top?)?;
+    if stack_state(1) != Some(MODS_PAGE) {
+        return None;
+    }
+    let state = CHILD_NAVIGATION.try_lock().ok()?;
+    matches!(state.page, ChildPageState::Open(owned) if owned == page).then_some(page)
 }
 
 fn note_state(state: Option<u32>) {
@@ -540,34 +903,31 @@ fn on_finalize(args: &mut options_finalize_page::Args) {
 
 /// Our page: draw it where the game draws its own, then finalize it like the others do.
 fn on_end(args: &mut options_end_page::Args) {
-    if top_state() != Some(MODS_PAGE) {
+    let state = top_state();
+    if let Some(child) = active_child(state) {
+        draw_picker_page(args.page, child);
         return;
     }
-    let waiting = draw_mods_page(args.page);
-    // SAFETY: nmspy `FinalizePage(page, changed, hide_footer)`, called as the game's own pages do
-    // right before EndPage. `changed` greys Apply / Cancel changes while nothing is staged and
-    // makes Back ask "apply / discard / cancel". It returns 0 nothing, 1 Apply, 2 Cancel changes
-    // (or Discard from the Back prompt), 3 Reset confirmed.
-    let finalize: FinalizeFn = unsafe { std::mem::transmute(FINALIZE.load(Ordering::Acquire)) };
-    let clicked = unsafe { finalize(args.page, u64::from(staged_count() > 0), 0) } as u32;
+    // A later child page must be ours unless the text popup restores the previous entry.
+    if let Ok(mut child) = CHILD_NAVIGATION.try_lock() {
+        child.close(state);
+    }
+    if state != Some(MODS_PAGE) {
+        return;
+    }
+    let waiting = input_blocked();
+    let open_child = draw_mods_page(args.page, waiting);
+    let clicked = finalize_page(args.page, staged_count() > 0, false);
     if clicked == FOOTER_RESET {
         RESET_UNTIL_MS.store(now_ms() + RESET_QUIET_MS, Ordering::Release);
     }
-    let text_click = TEXT_CLICK.lock().ok().and_then(|mut c| c.take());
-    if let Some((mod_name, key)) = text_click {
-        if clicked == FOOTER_RESET || now_ms() < RESET_UNTIL_MS.load(Ordering::Acquire) {
-            info(&format!("Mods page: {mod_name} {key} click ignored: it came with a Reset"));
-        } else if let Some(built) = current() {
-            if let Some(row) = built.sections.iter().flat_map(|s| s.rows.iter()).find(|r| r.mod_name == mod_name && r.key == key) {
-                let value = staged_get(mod_name, key)
-                    .or_else(|| REGISTRY.get().and_then(|r| r.get(mod_name, key)))
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_default();
-                start_edit(row, &value);
+    finish_text_click(MODS_PAGE);
+    if clicked == 0 {
+        if let Some(page) = open_child.filter(|_| !input_blocked() && now_ms() >= RESET_UNTIL_MS.load(Ordering::Acquire)) {
+            if let Ok(mut child) = CHILD_NAVIGATION.try_lock() {
+                child.page = ChildPageState::Requested(page);
             }
         }
-    }
-    if clicked == 0 {
         return;
     }
     // One line per click. The result is one-shot, so it is never dropped for the click cooldown or a
@@ -592,6 +952,130 @@ fn on_end(args: &mut options_end_page::Args) {
         FOOTER_RESET => reset_staged(registry, &built),
         _ => {}
     }
+}
+
+fn finish_text_click(page: u32) {
+    let Some((mod_name, key)) = TEXT_CLICK.try_lock().ok().and_then(|mut c| c.take()) else { return };
+    if now_ms() < RESET_UNTIL_MS.load(Ordering::Acquire) || top_state() != Some(page) {
+        return;
+    }
+    let Some(built) = current() else { return };
+    let Some(row) = built.sections.iter().flat_map(|s| &s.rows).find(|r| r.mod_name == mod_name && r.key == key) else { return };
+    let value = staged_get(mod_name, key)
+        .or_else(|| REGISTRY.get().and_then(|r| r.get(mod_name, key)))
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    start_edit(row, &value, page);
+}
+
+fn draw_clear_button(page: u64, label: *const u8, desc: *const u8, enabled: bool) -> bool {
+    let _disabled = (!enabled)
+        .then(|| DisabledRow::enter(page as usize, ROW_DISABLED_OFFSET.load(Ordering::Acquire)))
+        .flatten();
+    // SAFETY: the native Button signature and arguments are the same ones used for the Mods row.
+    let button: ButtonFn = unsafe { std::mem::transmute(BUTTON.load(Ordering::Acquire)) };
+    let clicked = unsafe { button(page, label, desc, BUTTON_OPTS.as_ptr()) };
+    enabled && clicked & 1 != 0
+}
+
+fn after_end(_args: &options_end_page::Args, _ret: u64) {
+    if OPTIONS_SCROLL_CALLER.load(Ordering::Acquire) == 0 {
+        open_requested_child(None);
+    }
+}
+
+fn open_requested_child(parent_scroll: Option<f32>) {
+    let child = {
+        let Ok(mut state) = CHILD_NAVIGATION.try_lock() else { return };
+        let ChildPageState::Requested(child) = state.page else { return };
+        if top_state() != Some(MODS_PAGE) {
+            state.page = ChildPageState::Closed;
+            return;
+        }
+        state.parent_scroll = parent_scroll;
+        state.return_scroll = None;
+        state.page = ChildPageState::Open(child);
+        child
+    };
+    // SAFETY: the validated dispatcher uses the same EndPage for all custom IDs.
+    WATCH_UNTIL_MS.store(0, Ordering::Release);
+    let request: RequestPageFn = unsafe { std::mem::transmute(REQUEST_PAGE.load(Ordering::Acquire)) };
+    unsafe { request(child.id() as i32, 1) };
+    info(&format!("Mods page: opened {} selector (parent scroll {parent_scroll:?})", child.setting().1));
+}
+
+fn draw_picker_page(page: u64, child: ChildPage) {
+    let (Some(built), Some(registry)) = (current(), REGISTRY.get()) else { return };
+    let (mod_name, key) = child.setting();
+    let Some(row) = built.sections.iter().flat_map(|s| &s.rows).find(|r| r.mod_name == mod_name && r.key == key) else { return };
+    let picker = built.picker(child);
+    let live = registry.get(mod_name, key);
+    let draft = staged_get(mod_name, key);
+    let shown = draft.as_ref().or(live.as_ref());
+    let text = shown.and_then(serde_json::Value::as_str).unwrap_or_default();
+    let selection = {
+        let Ok(mut selection) = picker.selection.try_lock() else { return };
+        selection.mask(child, text)
+    };
+    let mask = selection.unwrap_or_default();
+    let waiting = live.is_none() || input_blocked();
+    // SAFETY: unique signature match of the native Header.
+    let header: HeaderFn = unsafe { std::mem::transmute(HEADER.load(Ordering::Acquire)) };
+    unsafe { header(page, picker.header, ICON_ADVANCED) };
+    let mut fuel_edits = FuelEdits::default();
+    let mut mode_mask = mask;
+    {
+        // An invalid manual mode list must either be cleared or repaired as text. A toggle
+        // must never silently replace it with a different list.
+        let _disabled = selection.is_none()
+            .then(|| DisabledRow::enter(page as usize, ROW_DISABLED_OFFSET.load(Ordering::Acquire)))
+            .flatten();
+        for row in &picker.rows {
+            let selected = mask & row.mask != 0;
+            let desc = if selection.is_none() { picker.help } else { row.desc };
+            if let Some(changed) = draw_boolean(
+                page,
+                row.label,
+                desc,
+                selected,
+                false,
+                &BOOL_TEXT,
+            ).filter(|_| !waiting && selection.is_some()) {
+                match child {
+                    ChildPage::NeverSpend => fuel_edits.set_group(row.mask, changed, mask),
+                    ChildPage::MoreModes if changed => mode_mask |= row.mask,
+                    ChildPage::MoreModes => mode_mask &= !row.mask,
+                }
+            }
+        }
+    }
+    if TEXT_READY.load(Ordering::Acquire) {
+        draw_text(page, row, shown, waiting, &built.ui);
+    }
+    let clear = draw_clear_button(page, picker.clear_text, picker.clear_help, !waiting && !text.trim().is_empty());
+    let edited = if clear {
+        start_cooldown();
+        Some(String::new())
+    } else {
+        match child {
+            ChildPage::NeverSpend if !fuel_edits.is_empty() => quick_recharge::edit_fuel_exclusions(text, fuel_edits),
+            ChildPage::MoreModes if mode_mask != mask => Some(tool_mode_binds::more_modes_text(mode_mask)),
+            _ => None,
+        }
+    };
+    if let Some(text) = edited {
+        stage(mod_name, key, live.as_ref(), json!(text));
+    }
+    // The parent owns the draft and its footer. Keep the native Back action and page layout.
+    finalize_page(page, false, true);
+    finish_text_click(child.id());
+}
+
+/// Native footer, including the Back prompt. The game pops later, after it returns our action.
+fn finalize_page(page: u64, changed: bool, hide_footer: bool) -> u32 {
+    // SAFETY: nmspy `FinalizePage(page, changed, hide_footer)`, called before EndPage.
+    let finalize: FinalizeFn = unsafe { std::mem::transmute(FINALIZE.load(Ordering::Acquire)) };
+    unsafe { finalize(page, u64::from(changed), u64::from(hide_footer)) as u32 }
 }
 
 /// A NUL-terminated copy that lives for the whole process.
@@ -631,12 +1115,60 @@ fn build(registry: &Registry, lang: &'static str) -> Built {
         clear: text("clear"),
         clear_desc: text("clear_desc"),
         no_edit: text("no_edit"),
+        text_too_long: text("text_too_long"),
         not_set: menu_text::ui(lang, "not_set").to_string(),
         not_set_menu: menu_text::ui(lang, "not_set_menu").to_string(),
         clear_menu: text("clear_menu"),
         clear_desc_menu: text("clear_desc_menu"),
     };
-    Built { lang, ui, sections: build_sections(registry, lang) }
+    let mut fuels = Picker {
+        title: leak_cstr(menu_text::label(lang, QUICK_RECHARGE, NEVER_SPEND).unwrap_or("Never spend")),
+        help: text("never_spend_help"),
+        action: text("never_spend_select_fuels"),
+        header: text("never_spend_fuels_header"),
+        clear: text("never_spend_clear"),
+        clear_text: text("never_spend_clear_text"),
+        clear_help: text("never_spend_clear_help"),
+        summary_key: "never_spend_selection",
+        empty_key: "never_spend_no_selection",
+        rows: Vec::new(),
+        selection: Mutex::default(),
+    };
+    let mut modes = Picker {
+        title: leak_cstr(menu_text::label(lang, TOOL_MODE_BINDS, MORE_MODES).unwrap_or("More modes")),
+        help: text("more_modes_help"),
+        action: text("more_modes_select"),
+        header: text("more_modes_header"),
+        clear: text("more_modes_clear"),
+        clear_text: text("more_modes_clear"),
+        clear_help: text("clear_desc"),
+        summary_key: "more_modes_selection",
+        empty_key: "more_modes_no_selection",
+        rows: Vec::new(),
+        selection: Mutex::default(),
+    };
+    if CHILD_PAGES_VALIDATED.load(Ordering::Acquire) {
+        let mut names = HashMap::<&str, usize>::new();
+        for (picker, mod_name, key, entries, desc) in [
+            (&mut fuels, QUICK_RECHARGE, NEVER_SPEND,
+             quick_recharge::fuel_groups().into_iter().map(|fuel| (fuel.id, fuel.name, fuel.mask)).collect::<Vec<_>>(),
+             "never_spend_fuel"),
+            (&mut modes, TOOL_MODE_BINDS, MORE_MODES,
+             tool_mode_binds::selectable_modes().map(|(mode, mask)| (mode, mode, mask)).collect(),
+             "more_modes_mode"),
+        ] {
+            names.clear();
+            for (id, default, mask) in entries {
+                let name = menu_text::choice(lang, mod_name, key, id).unwrap_or(default);
+                let duplicate = names.entry(name).or_default();
+                let label = leak_cstr(&format!("{name}{}", " ".repeat(*duplicate)));
+                *duplicate += 1;
+                let desc = leak_cstr(&menu_text::fill(menu_text::ui(lang, desc), 0, name));
+                picker.rows.push(PickerRow { name, label, desc, mask });
+            }
+        }
+    }
+    Built { lang, ui, sections: build_sections(registry, lang), fuels, modes }
 }
 
 /// Build the sections from the registry. The game caches a row by its label, so a label that
@@ -646,7 +1178,13 @@ fn build_sections(registry: &Registry, lang: &'static str) -> Vec<Section> {
     let mut sections = Vec::new();
     for (mod_name, specs) in registry.all_specs() {
         let mut rows = Vec::new();
-        for spec in specs.iter().filter(|s| matches!(s.kind, Kind::Bool | Kind::Int | Kind::Float | Kind::Enum) || (s.kind == Kind::Text && TEXT_READY.load(Ordering::Acquire))) {
+        for spec in specs.iter() {
+            let picker = CHILD_PAGES_VALIDATED.load(Ordering::Acquire)
+                .then(|| ChildPage::from_setting(mod_name, spec.key))
+                .flatten();
+            if spec.kind == Kind::Text && picker.is_none() && !TEXT_READY.load(Ordering::Acquire) {
+                continue;
+            }
             let range = registry.range(mod_name, spec.key);
             let range_ok = match (spec.kind, range) {
                 (Kind::Bool | Kind::Text, _) => true,
@@ -657,7 +1195,11 @@ fn build_sections(registry: &Registry, lang: &'static str) -> Vec<Section> {
             if !range_ok {
                 continue;
             }
-            let plain = menu_text::label(lang, mod_name, spec.key).unwrap_or(spec.label);
+            let plain = match picker {
+                Some(ChildPage::NeverSpend) => menu_text::ui(lang, "never_spend_manual"),
+                Some(ChildPage::MoreModes) => menu_text::ui(lang, "more_modes_manual"),
+                None => menu_text::label(lang, mod_name, spec.key).unwrap_or(spec.label),
+            };
             let n = seen.entry(plain.to_string()).or_insert(0);
             let label = format!("{}{}", plain, " ".repeat(*n));
             *n += 1;
@@ -678,7 +1220,7 @@ fn build_sections(registry: &Registry, lang: &'static str) -> Vec<Section> {
                 default: registry.default_value(mod_name, spec.key),
                 desc: leak_cstr(menu_text::desc(lang, mod_name, spec.key).unwrap_or(plain)),
                 choices,
-                clear_label: if spec.kind == Kind::Text {
+                clear_label: if spec.kind == Kind::Text && picker.is_none() {
                     leak_cstr(&menu_text::fill(menu_text::ui(lang, "clear_label"), 0, &plain.to_lowercase()))
                 } else {
                     std::ptr::null()
@@ -728,6 +1270,10 @@ fn take_staged() -> HashMap<(&'static str, &'static str), serde_json::Value> {
 /// Opening the page always starts with nothing staged, in the game's current language.
 fn open_page_reset() {
     take_staged();
+    WATCH_UNTIL_MS.store(0, Ordering::Release);
+    if let Ok(mut child) = CHILD_NAVIGATION.try_lock() {
+        *child = ChildNavigation::NEW;
+    }
     refresh_language(true);
 }
 
@@ -763,18 +1309,36 @@ fn reset_staged(registry: &Registry, built: &Built) {
     info(&format!("Mods page: reset to defaults, {checked} setting(s) checked, {} waiting for Apply", staged_count()));
 }
 
-/// Draw every row. Returns true when a popup of ours is open (clicks must be ignored).
-fn draw_mods_page(page: u64) -> bool {
-    let (Some(registry), Some(built)) = (REGISTRY.get(), current()) else { return false };
+/// Draw every row, returning a request to open the selector when it was clicked.
+fn draw_mods_page(page: u64, waiting: bool) -> Option<ChildPage> {
+    let (Some(registry), Some(built)) = (REGISTRY.get(), current()) else { return None };
     // A popup of ours is open: draw every row but ignore what the player does to it.
-    let waiting = input_blocked();
     // SAFETY: unique signature match of the nmspy `Header`.
     let header: HeaderFn = unsafe { std::mem::transmute(HEADER.load(Ordering::Acquire)) };
+    let mut open_child = None;
     for section in &built.sections {
         unsafe { header(page, section.header, ICON_ADVANCED) };
         for row in &section.rows {
             let live = registry.get(row.mod_name, row.key);
             let shown = staged_get(row.mod_name, row.key).or_else(|| live.clone());
+            if let Some(child) = ChildPage::from_setting(row.mod_name, row.key) {
+                let picker = built.picker(child);
+                if !picker.rows.is_empty() {
+                    let cell = BooleanOptions { enabled: picker.action, disabled: picker.action };
+                    let differs = shown.as_ref() != row.default.as_ref();
+                    let text = shown.as_ref().and_then(serde_json::Value::as_str).unwrap_or_default();
+                    let desc = picker.selection.try_lock()
+                        .map_or(picker.help, |mut selection| selection.tooltip(child, picker, built.lang, text));
+                    if draw_boolean(page, picker.title, desc, false, differs, &cell) == Some(true) && !waiting {
+                        open_child = Some(child);
+                    }
+                    if draw_clear_button(page, picker.clear, picker.clear_help, !text.trim().is_empty() && !waiting) {
+                        stage(row.mod_name, row.key, live.as_ref(), json!(""));
+                        start_cooldown();
+                    }
+                    continue;
+                }
+            }
             let changed = match (row.kind, row.range) {
                 (Kind::Text, _) => draw_text(page, row, shown.as_ref(), waiting, &built.ui),
                 (Kind::Bool, _) => draw_bool(page, row, shown.as_ref()),
@@ -788,18 +1352,22 @@ fn draw_mods_page(page: u64) -> bool {
             }
         }
     }
-    waiting
+    open_child
 }
 
 /// Each `draw_*` returns the new value when the player changed the row, `None` otherwise.
 fn draw_bool(page: u64, row: &Row, shown: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let current = shown.and_then(|v| v.as_bool()).unwrap_or(false);
+    // The game enables Reset while a row differs from the default it was given, so pass the real one.
+    let default = row.default.as_ref().and_then(|v| v.as_bool()).unwrap_or(current);
+    draw_boolean(page, row.label, row.desc, current, default, &BOOL_TEXT).map(|value| json!(value))
+}
+
+fn draw_boolean(page: u64, label: *const u8, desc: *const u8, current: bool, default: bool, text: &BooleanOptions) -> Option<bool> {
     // SAFETY: unique signature match of the nmspy `Boolean`.
     let boolean: BooleanFn = unsafe { std::mem::transmute(BOOLEAN.load(Ordering::Acquire)) };
-    let current = u8::from(shown.and_then(|v| v.as_bool()).unwrap_or(false));
-    // The game enables Reset while a row differs from the default it was given, so pass the real one.
-    let default = row.default.as_ref().and_then(|v| v.as_bool()).map_or(current, u8::from);
-    let value = unsafe { boolean(page, row.label, row.desc, current, default, &BOOL_TEXT) } & 1;
-    (value != current).then(|| json!(value != 0))
+    let value = unsafe { boolean(page, label, desc, u8::from(current), u8::from(default), text) } & 1 != 0;
+    (value != current).then_some(value)
 }
 
 fn draw_int(page: u64, row: &Row, shown: Option<&serde_json::Value>, (min, max, step, default): (i32, i32, i32, i32)) -> Option<serde_json::Value> {
@@ -929,18 +1497,19 @@ fn draw_text(
     };
     // The cell shows the value in both states; the row is shown as "off", so any click comes back as "on".
     let cell = BooleanOptions { enabled: ptr, disabled: ptr };
-    let desc = if editable { row.desc } else { ui.no_edit };
+    let can_type = editable && value.len() <= INITIAL_MAX;
+    let desc = if !editable { ui.no_edit } else if !can_type { ui.text_too_long } else { row.desc };
     // Shown as "off" (0); the default is 1 while the text differs from its default, so Reset stays enabled.
     let differs = row.default.as_ref().and_then(|d| d.as_str()).is_some_and(|d| d != value);
     let clicked = {
-        let _disabled = (!editable)
+        let _disabled = (!can_type)
             .then(|| DisabledRow::enter(page as usize, ROW_DISABLED_OFFSET.load(Ordering::Acquire)))
             .flatten();
         (unsafe { boolean(page, row.label, desc, 0, u8::from(differs), &cell) } & 1) != 0
     };
-    if clicked && !waiting && editable {
+    if clicked && !waiting && can_type {
         // The popup starts from the staged value if there is one, so an edit builds on it.
-        if let Ok(mut click) = TEXT_CLICK.lock() {
+        if let Ok(mut click) = TEXT_CLICK.try_lock() {
             *click = Some((row.mod_name, row.key));
         }
     }
@@ -966,7 +1535,7 @@ fn draw_text(
 }
 
 /// Open the game's text popup for one setting. Refuses (and says why) rather than risk a bad state.
-fn start_edit(row: &Row, value: &str) {
+fn start_edit(row: &Row, value: &str, page: u32) {
     if !OPENED_IN_GAME.load(Ordering::Acquire) {
         info("text edit not started: the text box is only drawn in game");
         return;
@@ -983,7 +1552,7 @@ fn start_edit(row: &Row, value: &str) {
         return;
     }
     if value.len() > INITIAL_MAX {
-        info(&format!("{} {}: value is {} bytes, too long to edit in the game (limit {INITIAL_MAX}); edit it in the NMS.rs window", row.mod_name, row.key, value.len()));
+        info(&format!("{} {}: value is {} bytes, too long to edit in the game (limit {INITIAL_MAX}); use the NMS.rs set command", row.mod_name, row.key, value.len()));
         return;
     }
     let Ok(mut pending) = PENDING.lock() else { return };
@@ -1001,7 +1570,7 @@ fn start_edit(row: &Row, value: &str) {
         info("text edit not started: the game did not open its text box");
         return;
     }
-    *pending = Some((row.mod_name, row.key));
+    *pending = Some(TextEdit { page, mod_name: row.mod_name, key: row.key });
     STARTED_MS.store(now_ms(), Ordering::Release);
     info(&format!(
         "text edit started: {} {} (keyboard flag {:?}, state {:?})",
@@ -1108,8 +1677,7 @@ fn real_mgr() -> Option<usize> {
     super::context::data(APP_GLOBAL.load(Ordering::Acquire)).map(|app| app + TEXT_MGR_OFFSET)
 }
 
-/// The press that closes the box with B can also reach the page as Back and leave the Mods page. If
-/// the page is popped right after a popup closed, open it again.
+/// Restore the page if the press that closed the text box also reached it as Back.
 fn restore_page_if_popped() {
     let until = WATCH_UNTIL_MS.load(Ordering::Acquire);
     if until == 0 {
@@ -1119,13 +1687,23 @@ fn restore_page_if_popped() {
         WATCH_UNTIL_MS.store(0, Ordering::Release);
         return;
     }
-    if top_state() != Some(MODS_PAGE) && OPENED_IN_GAME.load(Ordering::Acquire) {
-        WATCH_UNTIL_MS.store(0, Ordering::Release);
-        info("Mods page was left by the press that closed the text box: opening it again");
-        // SAFETY: nmspy `RequestOptionsPage(eOptionsMenu, bool)`, as the Mods row click calls it.
-        let request: RequestPageFn = unsafe { std::mem::transmute(REQUEST_PAGE.load(Ordering::Acquire)) };
-        unsafe { request(MODS_PAGE as i32, 1) };
+    let page = WATCH_PAGE.load(Ordering::Acquire);
+    let current = top_state();
+    if current == Some(page) || !OPENED_IN_GAME.load(Ordering::Acquire) {
+        return;
     }
+    WATCH_UNTIL_MS.store(0, Ordering::Release);
+    if let Some(page) = ChildPage::from_id(page) {
+        if current != Some(MODS_PAGE) {
+            return;
+        }
+        let Ok(mut child) = CHILD_NAVIGATION.try_lock() else { return };
+        child.page = ChildPageState::Open(page);
+    }
+    info("Options page was left by the press that closed the text box: opening it again");
+    // SAFETY: nmspy `RequestOptionsPage(eOptionsMenu, bool)`, as the Mods row click calls it.
+    let request: RequestPageFn = unsafe { std::mem::transmute(REQUEST_PAGE.load(Ordering::Acquire)) };
+    unsafe { request(page as i32, 1) };
 }
 
 /// Every frame, after the game's text-entry update: take the manager, and finish or abandon our popup.
@@ -1138,14 +1716,14 @@ fn on_text_update(args: &text_input_update::Args, _ret: u64) {
     release_input_if_due();
     restore_page_if_popped();
     let Ok(mut pending) = PENDING.lock() else { return };
-    let Some((mod_name, key)) = *pending else { return };
+    let Some(&TextEdit { page, mod_name, key }) = pending.as_ref() else { return };
     // The player left our page (mouse Back, a game state change) with the box open: close it for them.
-    if top_state() != Some(MODS_PAGE) {
-            DONE_SEEN_MS.store(0, Ordering::Release);
+    if top_state() != Some(page) {
+        DONE_SEEN_MS.store(0, Ordering::Release);
         close_popup(mgr);
         *pending = None;
         start_cooldown();
-        info(&format!("text edit abandoned: left the Mods page ({mod_name} {key} unchanged)"));
+        info(&format!("text edit abandoned: left the options page ({mod_name} {key} unchanged)"));
         return;
     }
     // The game closed the box (state 2). Keep it reading as busy for a moment before we take the result.
@@ -1168,7 +1746,7 @@ fn on_text_update(args: &text_input_update::Args, _ret: u64) {
         // Still open. If something else closed it, stop waiting.
         if read_u32(mgr + TEXT_STATE_OFFSET) == Some(0) {
             *pending = None;
-                    start_cooldown();
+            start_cooldown();
             info(&format!("text edit ended without a result ({mod_name} {key} unchanged)"));
         }
         return;
@@ -1177,6 +1755,7 @@ fn on_text_update(args: &text_input_update::Args, _ret: u64) {
     // The game closed the box and gave input back in this same frame: keep it off a moment so the
     // press that closed the box (B on a controller) does not also reach the page.
     hold_input();
+    WATCH_PAGE.store(page, Ordering::Release);
     WATCH_UNTIL_MS.store(now_ms() + WATCH_MS, Ordering::Release);
     *pending = None;
     drop(pending);
@@ -1205,9 +1784,16 @@ fn pad_name(name: &str) -> [u8; 16] {
 
 /// After the game set the title for its own pages: on ours, put "MODS" into the header text.
 fn on_title(_args: &options_page_title::Args, _ret: u64) {
-    if top_state() != Some(MODS_PAGE) {
-        return;
-    }
+    let title = match top_state() {
+        Some(MODS_PAGE) => {
+            let Some(built) = current() else { return };
+            built.ui.title
+        }
+        page => {
+            let (Some(built), Some(child)) = (current(), active_child(page)) else { return };
+            built.picker(child).title
+        }
+    };
     let Some(root) = read_ptr(TITLE_ROOT.load(Ordering::Acquire)) else { return };
     let mut name = pad_name("HEADERTEXT");
     let mut hashed = [0u8; 24];
@@ -1223,8 +1809,7 @@ fn on_title(_args: &options_page_title::Args, _ret: u64) {
     let Some(set_text) = read_ptr(vtable + 0x90) else { return };
     // SAFETY: virtual slot 0x90 of the text element is the call the title function makes with a text id.
     let set_text: SetTextFn = unsafe { std::mem::transmute(set_text) };
-    let Some(built) = current() else { return };
-    unsafe { set_text(element as u64, built.ui.title) };
+    unsafe { set_text(element as u64, title) };
 }
 
 /// After the game drew the pause list: handle our `BUTTON_MODS` row the way the page handles its own.
@@ -1281,6 +1866,27 @@ mod tests {
         let end = buf.iter().position(|&b| b == 0).unwrap();
         assert!(std::str::from_utf8(&buf[..end]).is_ok());
         assert_eq!(fixed64("abc")[..4], *b"abc\0");
+    }
+
+    #[test]
+    fn fuel_summary_follows_the_same_parsed_selection_as_the_rows() {
+        let rows: Vec<_> = quick_recharge::fuel_groups().into_iter().map(|fuel| PickerRow {
+            name: fuel.name,
+            label: std::ptr::null(),
+            desc: std::ptr::null(),
+            mask: fuel.mask,
+        }).collect();
+        let mut selection = PickerSelection::default();
+        let fuel_summary = |mask: Option<u64>| selected_summary("en", &rows, mask.unwrap(), "never_spend_selection", "never_spend_no_selection");
+        let summary = fuel_summary(selection.mask(ChildPage::NeverSpend, "FUEL1, Carbon, Sodium, unknownzz"));
+        assert_eq!(summary, "Selected to exclude: Carbon, Sodium.");
+        let summary = fuel_summary(selection.mask(ChildPage::NeverSpend, "DUSTY1, DUST1, CATALYST2"));
+        assert_eq!(summary, "Selected to exclude: Sodium Nitrate, Pyrite.");
+        assert_eq!(fuel_summary(selection.mask(ChildPage::NeverSpend, "")), "No fuels selected for exclusion.");
+        assert_eq!(
+            fuel_summary(selection.mask(ChildPage::NeverSpend, "PLANT_HOT, FUEL1")),
+            "Selected to exclude: Carbon."
+        );
     }
 
     #[test]
@@ -1353,6 +1959,86 @@ mod tests {
             assert_eq!(row_disabled_offset(&changed, 0), None);
         }
         assert_eq!(row_disabled_offset(&FileImage::from_code(&[0; 32]), 0), None);
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly supplied executable path"]
+    fn child_navigation_matches_supplied_executable() {
+        let path = std::env::var_os("NMS_OPTIONS_CHECK_EXE").expect("set NMS_OPTIONS_CHECK_EXE");
+        let image = FileImage::load(std::path::Path::new(&path)).unwrap();
+        validate_child_navigation(&image).unwrap();
+        let dispatch = find(&image, "options page dispatch", sigs::OPTIONS_PAGE_DISPATCH).unwrap();
+        let push = find(&image, "options page push", sigs::OPTIONS_PAGE_PUSH).unwrap();
+        let pop = find(&image, "options page pop", sigs::OPTIONS_PAGE_POP).unwrap();
+        println!("Read-only child navigation: dispatch {dispatch:#x}, push {push:#x}, pop {pop:#x}");
+        // Break a relative operand without altering the surrounding signature bytes.
+        for (operand, diagnostic) in [
+            (dispatch + 0x30, "custom page dispatch"),
+            (push + 0x1D, "RequestOptionsPage"),
+            (pop + 0x13, "OptionsBack"),
+        ] {
+            let mut changed = image.clone();
+            changed.write(operand, &i32::MAX.to_le_bytes()).unwrap();
+            assert!(validate_child_navigation(&changed).unwrap_err().contains(diagnostic));
+        }
+    }
+
+    #[test]
+    fn restores_scroll_only_when_returning_to_mods() {
+        let mut state = ChildNavigation {
+            page: ChildPageState::Open(ChildPage::NeverSpend),
+            parent_scroll: Some(-200.0),
+            return_scroll: None,
+        };
+        state.close(Some(MODS_PAGE));
+        assert_eq!(state.return_scroll.map(|restore| restore.position), Some(-200.0));
+        assert_eq!(state.finish_scroll_pass(Some(0.0)), None);
+        assert_eq!(state.finish_scroll_pass(Some(-200.0)).map(|restore| restore.passes_left), Some(SCROLL_RESTORE_PASSES - 2));
+        state.close(Some(MODS_PAGE));
+        assert_eq!(state.return_scroll, None);
+
+        // The text-popup recovery may reopen the same child. The original snapshot survives.
+        state.page = ChildPageState::Open(ChildPage::NeverSpend);
+        state.close(Some(MODS_PAGE));
+        assert_eq!(state.return_scroll.map(|restore| restore.position), Some(-200.0));
+        assert_eq!(state.finish_scroll_pass(Some(0.0)), None);
+        assert_eq!(state.finish_scroll_pass(Some(-200.0)).map(|restore| restore.passes_left), Some(SCROLL_RESTORE_PASSES - 2));
+
+        state.page = ChildPageState::Open(ChildPage::MoreModes);
+        state.close(Some(LIST_PAGE));
+        assert_eq!(state.return_scroll, None);
+
+        let mut state = ChildNavigation::NEW;
+        state.page = ChildPageState::Open(ChildPage::MoreModes);
+        state.close(Some(MODS_PAGE));
+        assert_eq!(state.return_scroll, None);
+    }
+
+    #[test]
+    fn scroll_fraction_uses_available_extent() {
+        assert_eq!(scroll_fraction(-1200.0, 3000.0, 1000.0), Some(0.6));
+        assert_eq!(scroll_fraction(-1200.0, 1200.0, 1000.0), Some(1.0));
+        assert_eq!(scroll_fraction(-1200.0, 1000.0, 1000.0), None);
+        assert_eq!(scroll_fraction(-1200.0, 1400.0, f32::NAN), None);
+
+        let mut state = ChildNavigation::NEW;
+        state.return_scroll = Some(ScrollRestore { position: -1200.0, passes_left: 2 });
+        assert_eq!(state.finish_scroll_pass(None), None);
+        assert_eq!(state.finish_scroll_pass(Some(0.0)).map(|restore| restore.passes_left), Some(0));
+        assert!(state.return_scroll.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly supplied executable path"]
+    fn scroll_layout_matches_supplied_executable() {
+        let path = std::env::var_os("NMS_OPTIONS_CHECK_EXE").expect("set NMS_OPTIONS_CHECK_EXE");
+        let mut image = FileImage::load(std::path::Path::new(&path)).unwrap();
+        let (scroll, caller, height) = options_scroll_layout(&image).unwrap();
+        let call = find(&image, "options scroll call", sigs::OPTIONS_SCROLL_CALL).unwrap();
+        let clamp = find(&image, "options scroll clamp", sigs::OPTIONS_SCROLL_CLAMP).unwrap();
+        println!("Read-only scroll layout: caller {caller:#x}, updater {scroll:#x}, clamp {clamp:#x}, viewport height {height:#x}");
+        image.write(call + sigs::OPTIONS_SCROLL_CALL_AT + 1, &1i32.to_le_bytes()).unwrap();
+        assert!(options_scroll_layout(&image).unwrap_err().contains("scroll layout changed"));
     }
 
     #[test]
